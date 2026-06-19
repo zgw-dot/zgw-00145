@@ -19,6 +19,7 @@ const STATUS_MAP = {
   draft: { label: '草稿', color: 'default' },
   pending_approval: { label: '待审', color: 'processing' },
   published: { label: '已发布', color: 'success' },
+  revoking: { label: '撤销中', color: 'warning' },
   rolled_back: { label: '已回滚', color: 'warning' },
   revoked: { label: '已撤销', color: 'error' },
 }
@@ -31,10 +32,14 @@ export default function LabelDetail({ user }) {
   const [loading, setLoading] = useState(false)
   const [rollbackOpen, setRollbackOpen] = useState(false)
   const [revokeOpen, setRevokeOpen] = useState(false)
+  const [revokeRequestOpen, setRevokeRequestOpen] = useState(false)
   const [form] = Form.useForm()
   const [revokeForm] = Form.useForm()
+  const [revokeRequestForm] = Form.useForm()
 
   const canRollback = user?.role === 'admin'
+  const canDirectRevoke = user?.role === 'admin'
+  const canRevokeRequest = ['admin', 'operator'].includes(user?.role)
 
   useEffect(() => { loadDetail() }, [id])
 
@@ -86,6 +91,25 @@ export default function LabelDetail({ user }) {
     }
   }
 
+  const handleRevokeRequest = async (values) => {
+    try {
+      const res = await api.post('/labels/revoke-request', {
+        label_ids: [parseInt(id)],
+        reason: values.reason
+      })
+      if (res.data.success_count > 0) {
+        message.success('撤销申请已提交，待管理员审批')
+      } else if (res.data.failed.length > 0) {
+        message.warning(res.data.failed[0].reason)
+      }
+      setRevokeRequestOpen(false)
+      revokeRequestForm.resetFields()
+      loadDetail()
+    } catch (err) {
+      message.error(err.message)
+    }
+  }
+
   if (!data) return <div style={{ padding: 40 }}>加载中...</div>
 
   const { label, rollback_history: rh, versions } = data
@@ -119,19 +143,28 @@ export default function LabelDetail({ user }) {
           </Space>
         </div>
         <Space>
+          {(label.status === 'published' || label.status === 'revoking') && canRevokeRequest && (
+            <Button
+              danger
+              icon={<StopOutlined />}
+              onClick={() => setRevokeRequestOpen(true)}
+            >
+              申请撤销
+            </Button>
+          )}
+          {label.status === 'published' && canDirectRevoke && (
+            <Button
+              danger
+              icon={<StopOutlined />}
+              onClick={() => setRevokeOpen(true)}
+            >
+              直接撤销
+            </Button>
+          )}
           {label.status === 'published' && canRollback && (
-            <>
-              <Button
-                danger
-                icon={<StopOutlined />}
-                onClick={() => setRevokeOpen(true)}
-              >
-                发布撤销
-              </Button>
-              <Button danger icon={<RollbackOutlined />} onClick={() => setRollbackOpen(true)}>
-                回滚此价签
-              </Button>
-            </>
+            <Button danger icon={<RollbackOutlined />} onClick={() => setRollbackOpen(true)}>
+              回滚此价签
+            </Button>
           )}
         </Space>
       </div>
@@ -233,7 +266,7 @@ export default function LabelDetail({ user }) {
             />
           </Card>
 
-          {rollback_history?.length > 0 && (
+          {rh?.length > 0 && (
             <Card title="回滚历史记录" size="small" style={{ marginTop: 16 }}>
               <Table
                 size="small"
@@ -367,6 +400,32 @@ export default function LabelDetail({ user }) {
                 如果该价签已有已打印记录，将无法直接撤销，需先记录线下处理原因并回收已打印价签。
               </Text>
             </div>
+          </div>
+        </Form>
+      </Modal>
+
+      <Modal
+        title={`撤销申请价签 #${label.id}`}
+        open={revokeRequestOpen}
+        onCancel={() => { setRevokeRequestOpen(false); revokeRequestForm.resetFields() }}
+        onOk={() => revokeRequestForm.submit()}
+        okText="提交申请"
+        okButtonProps={{ danger: true }}
+        destroyOnClose
+        width={560}
+      >
+        <Form form={revokeRequestForm} layout="vertical" onFinish={handleRevokeRequest}>
+          <Form.Item
+            name="reason"
+            label="撤销原因"
+            rules={[{ required: true, message: '请填写撤销原因' }]}
+          >
+            <TextArea rows={4} placeholder="请详细说明撤销发布的原因，管理员审批后生效" maxLength={200} showCount />
+          </Form.Item>
+          <div style={{ padding: 12, background: '#fffbe6', borderRadius: 6, border: '1px solid #ffe58f' }}>
+            <Text type="warning" strong>
+              提交后价签将进入"撤销中"状态，不再进入打印队列，待管理员批准或驳回。审批期间不可重复提交申请。
+            </Text>
           </div>
         </Form>
       </Modal>

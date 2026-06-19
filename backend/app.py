@@ -733,7 +733,8 @@ def export_precheck():
             '建议动作': r['suggested_action'],
         })
 
-    df = pd.DataFrame(rows)
+    columns = ['价签ID', 'SKU', '门店', '生效开始时间', '生效结束时间', '分组', '风险原因', '建议动作']
+    df = pd.DataFrame(rows, columns=columns)
     output = StringIO()
     df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
     output.seek(0)
@@ -1403,7 +1404,8 @@ def export_labels():
             '关联批次ID': l.batch_id or '',
         })
 
-    df = pd.DataFrame(rows)
+    columns = ['ID', '版本号', 'SKU', '门店', '原价', '促销价', '折扣率', '生效开始时间', '生效结束时间', '模板', '状态', '创建人', '创建时间', '提交时间', '审批人', '审批时间', '发布人', '发布时间', '是否回滚', '回滚人', '回滚时间', '回滚原因', '是否撤销', '撤销人', '撤销时间', '撤销原因', '上一版本ID', '关联批次ID']
+    df = pd.DataFrame(rows, columns=columns)
     output = StringIO()
     df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
     output.seek(0)
@@ -1420,9 +1422,11 @@ def export_print_queue():
     status = request.args.get('status', '')
     store = request.args.get('store', '')
 
-    query = PrintQueue.query
+    query = PrintQueue.query.join(PriceLabel, PrintQueue.label_id == PriceLabel.id).filter(
+        PriceLabel.status != 'revoking'
+    )
     if status:
-        query = query.filter_by(status=status)
+        query = query.filter(PrintQueue.status == status)
     if store:
         query = query.filter(PrintQueue.store.like(f'%{store}%'))
 
@@ -1444,7 +1448,8 @@ def export_print_queue():
             '创建时间': i.created_at.strftime('%Y-%m-%d %H:%M:%S')
         })
 
-    df = pd.DataFrame(rows)
+    columns = ['ID', '价签ID', 'SKU', '门店', '原价', '促销价', '生效开始时间', '生效结束时间', '模板', '状态', '创建时间']
+    df = pd.DataFrame(rows, columns=columns)
     output = StringIO()
     df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
     output.seek(0)
@@ -1495,7 +1500,8 @@ def export_rollback_history():
             '操作时间': r.created_at.strftime('%Y-%m-%d %H:%M:%S'),
         })
 
-    df = pd.DataFrame(rows)
+    columns = ['记录ID', '价签ID', 'SKU', '门店', '从版本', '到版本', '从状态', '到状态', '回滚方式', '回滚原因', '操作人', '操作时间']
+    df = pd.DataFrame(rows, columns=columns)
     output = StringIO()
     df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
     output.seek(0)
@@ -1543,7 +1549,8 @@ def export_revocation_logs():
             '受影响打印清单ID': r.affected_print_queue_ids or '',
         })
 
-    df = pd.DataFrame(rows)
+    columns = ['记录ID', '价签ID', 'SKU', '门店', '原状态', '撤销原因', '操作人', '操作时间', '受影响打印清单ID']
+    df = pd.DataFrame(rows, columns=columns)
     output = StringIO()
     df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
     output.seek(0)
@@ -1605,7 +1612,8 @@ def export_revocation_requests():
             '受影响打印清单ID': r.affected_print_queue_ids or '',
         })
 
-    df = pd.DataFrame(rows)
+    columns = ['申请ID', '价签ID', 'SKU', '门店', '申请时状态', '申请原因', '申请状态', '线下处理说明', '申请人', '申请时间', '审批人', '审批时间', '审批意见', '受影响打印清单ID']
+    df = pd.DataFrame(rows, columns=columns)
     output = StringIO()
     df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
     output.seek(0)
@@ -1664,7 +1672,8 @@ def export_revocation_request_logs():
             '受影响打印清单ID': r.affected_print_queue_ids or '',
         })
 
-    df = pd.DataFrame(rows)
+    columns = ['记录ID', '申请ID', '价签ID', 'SKU', '门店', '操作类型', '原状态', '原因/意见', '操作人', '操作时间', '受影响打印清单ID']
+    df = pd.DataFrame(rows, columns=columns)
     output = StringIO()
     df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
     output.seek(0)

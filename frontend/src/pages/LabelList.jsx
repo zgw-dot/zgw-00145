@@ -18,6 +18,7 @@ const STATUS_MAP = {
   draft: { label: '草稿', color: 'default' },
   pending_approval: { label: '待审', color: 'processing' },
   published: { label: '已发布', color: 'success' },
+  revoking: { label: '撤销中', color: 'warning' },
   rolled_back: { label: '已回滚', color: 'warning' },
   revoked: { label: '已撤销', color: 'error' },
 }
@@ -38,10 +39,14 @@ export default function LabelList({ user }) {
 
   const canSubmit = ['admin', 'operator'].includes(user?.role)
   const canExport = ['admin', 'operator', 'clerk'].includes(user?.role)
-  const canRevoke = user?.role === 'admin'
+  const canDirectRevoke = user?.role === 'admin'
+  const canRevokeRequest = ['admin', 'operator'].includes(user?.role)
   const [revokeModalOpen, setRevokeModalOpen] = useState(false)
   const [revokeReason, setRevokeReason] = useState('')
   const [revoking, setRevoking] = useState(false)
+  const [revokeRequestModalOpen, setRevokeRequestModalOpen] = useState(false)
+  const [revokeRequestReason, setRevokeRequestReason] = useState('')
+  const [revokeRequesting, setRevokeRequesting] = useState(false)
 
   useEffect(() => {
     loadData(1, 20)
@@ -110,6 +115,51 @@ export default function LabelList({ user }) {
     }
     setRevokeReason('')
     setRevokeModalOpen(true)
+  }
+
+  const handleBatchRevokeRequest = () => {
+    const candidates = data.filter(d => selectedRowKeys.includes(d.id) && (d.status === 'published' || d.status === 'revoking'))
+    if (candidates.length === 0) {
+      message.warning('请选择至少一条已发布或撤销中的价签')
+      return
+    }
+    setRevokeRequestReason('')
+    setRevokeRequestModalOpen(true)
+  }
+
+  const handleSingleRevokeRequest = (record) => {
+    if (record.status !== 'published' && record.status !== 'revoking') {
+      message.warning('只有已发布或撤销中的价签可以申请撤销')
+      return
+    }
+    setSelectedRowKeys([record.id])
+    setRevokeRequestReason('')
+    setRevokeRequestModalOpen(true)
+  }
+
+  const confirmRevokeRequest = async () => {
+    if (!revokeRequestReason.trim()) {
+      message.warning('请填写撤销原因')
+      return
+    }
+    setRevokeRequesting(true)
+    try {
+      const res = await api.post('/labels/revoke-request', {
+        label_ids: selectedRowKeys,
+        reason: revokeRequestReason.trim()
+      })
+      message.success(`成功提交 ${res.data.success_count} 条撤销申请，失败 ${res.data.failed.length} 条`)
+      if (res.data.failed.length > 0) {
+        res.data.failed.forEach(f => message.warning(`价签 #${f.id}: ${f.reason}`))
+      }
+      setRevokeRequestModalOpen(false)
+      setSelectedRowKeys([])
+      loadData(pagination.current, pagination.pageSize)
+    } catch (err) {
+      message.error(err.message)
+    } finally {
+      setRevokeRequesting(false)
+    }
   }
 
   const confirmRevoke = async () => {
@@ -214,13 +264,18 @@ export default function LabelList({ user }) {
     {
       title: '操作',
       key: 'action',
-      width: 140,
+      width: 200,
       fixed: 'right',
       render: (_, r) => (
         <Space>
           <Button type="link" size="small" icon={<EyeOutlined />} onClick={() => navigate(`/labels/${r.id}`)}>
             详情
           </Button>
+          {canRevokeRequest && (r.status === 'published' || r.status === 'revoking') && (
+            <Button type="link" size="small" danger onClick={() => handleSingleRevokeRequest(r)}>
+              申请撤销
+            </Button>
+          )}
         </Space>
       ),
     },
@@ -236,14 +291,24 @@ export default function LabelList({ user }) {
               导出 CSV
             </Button>
           )}
-          {canRevoke && (
+          {canRevokeRequest && (
+            <Button
+              danger
+              icon={<StopOutlined />}
+              disabled={selectedRowKeys.length === 0}
+              onClick={handleBatchRevokeRequest}
+            >
+              申请撤销 ({data.filter(d => selectedRowKeys.includes(d.id) && (d.status === 'published' || d.status === 'revoking')).length})
+            </Button>
+          )}
+          {canDirectRevoke && (
             <Button
               danger
               icon={<StopOutlined />}
               disabled={selectedRowKeys.length === 0}
               onClick={handleBatchRevoke}
             >
-              发布撤销 ({data.filter(d => selectedRowKeys.includes(d.id) && d.status === 'published').length})
+              直接撤销 ({data.filter(d => selectedRowKeys.includes(d.id) && d.status === 'published').length})
             </Button>
           )}
           {canSubmit && (
@@ -307,10 +372,10 @@ export default function LabelList({ user }) {
           dataSource={data}
           loading={loading}
           scroll={{ x: 1400 }}
-          rowSelection={canSubmit || canRevoke ? {
+          rowSelection={canSubmit || canDirectRevoke || canRevokeRequest ? {
             selectedRowKeys,
             onChange: setSelectedRowKeys,
-            getCheckboxProps: (r) => ({ disabled: r.status !== 'draft' && r.status !== 'published' }),
+            getCheckboxProps: (r) => ({ disabled: r.status !== 'draft' && r.status !== 'published' && r.status !== 'revoking' }),
           } : undefined}
           pagination={{
             ...pagination,
@@ -347,6 +412,35 @@ export default function LabelList({ user }) {
         <div style={{ padding: 12, background: '#fff2f0', borderRadius: 6, border: '1px solid #ffccc7', marginTop: 12 }}>
           <Text type="danger" strong>
             撤销后价签将从"已发布"变为"已撤销"，未打印的打印清单项将被同步移除。如已有已打印记录，将无法撤销。
+          </Text>
+        </div>
+      </Modal>
+
+      <Modal
+        title="撤销申请"
+        open={revokeRequestModalOpen}
+        onCancel={() => setRevokeRequestModalOpen(false)}
+        onOk={confirmRevokeRequest}
+        okText="提交申请"
+        okButtonProps={{ danger: true }}
+        confirmLoading={revokeRequesting}
+        destroyOnClose
+        width={520}
+      >
+        <div style={{ marginBottom: 16 }}>
+          <Text>即将对 <Text strong>{data.filter(d => selectedRowKeys.includes(d.id) && (d.status === 'published' || d.status === 'revoking')).length}</Text> 条价签提交撤销申请。</Text>
+        </div>
+        <Input.TextArea
+          rows={4}
+          value={revokeRequestReason}
+          onChange={(e) => setRevokeRequestReason(e.target.value)}
+          placeholder="请填写撤销原因（必填），管理员审批后将生效"
+          maxLength={200}
+          showCount
+        />
+        <div style={{ padding: 12, background: '#fffbe6', borderRadius: 6, border: '1px solid #ffe58f', marginTop: 12 }}>
+          <Text type="warning" strong>
+            提交后价签将进入"撤销中"状态，不再进入打印队列，待管理员批准或驳回。审批期间不可重复提交申请。
           </Text>
         </div>
       </Modal>
