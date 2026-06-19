@@ -13,6 +13,7 @@ from models import (
     db, User, SystemConfig, ImportBatch, ImportValidation,
     PriceLabel, RollbackHistory, PrintQueue
 )
+from validation import check_publish_approval, is_in_publish_window
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 INSTANCE_DIR = os.path.join(BASE_DIR, 'instance')
@@ -210,16 +211,6 @@ def validate_label_row(row, discount_floor, store_whitelist, check_overlap=True)
         }
     }
 
-
-def is_in_publish_window():
-    cfg = get_config('publish_window', {'enabled': False})
-    if not cfg or not cfg.get('enabled'):
-        return True
-    now = datetime.now()
-    if cfg.get('weekdays_only') and now.weekday() >= 5:
-        return False
-    hour = now.hour
-    return cfg.get('start_hour', 0) <= hour < cfg.get('end_hour', 24)
 
 
 # ==================== 认证接口 ====================
@@ -582,64 +573,36 @@ def approve_labels():
     failed = []
 
     if approve:
-        approved_set = {}
+        check_results = check_publish_approval(label_ids)
 
         for lid in label_ids:
-            label = PriceLabel.query.get(lid)
-            if not label:
+            r = check_results.get(lid)
+            if not r:
                 failed.append({'id': lid, 'reason': '价签不存在'})
                 continue
-            if label.status != 'pending_approval':
-                failed.append({'id': lid, 'reason': f'状态为{label.status}，不能审批'})
+            if r['group'] != 'publishable':
+                failed.append({'id': lid, 'reason': r['risk_reason']})
                 continue
 
-            overlap_db = PriceLabel.query.filter(
-                PriceLabel.sku == label.sku,
-                PriceLabel.store == label.store,
-                PriceLabel.id != label.id,
-                PriceLabel.status == 'published',
-                PriceLabel.effective_from < label.effective_to,
-                PriceLabel.effective_to > label.effective_from
-            ).first()
-            if overlap_db:
-                failed.append({'id': lid, 'reason': f'与已发布价签(ID:{overlap_db.id})生效时段重叠'})
-                continue
+            label = PriceLabel.query.get(lid)
+            label.status = 'published'
+            label.approved_at = now
+            label.approved_by = user.id
+            label.published_at = now
+            label.published_by = user.id
 
-            key = f'{label.store}|{label.sku}'
-            batch_overlap = False
-            if key in approved_set:
-                for other in approved_set[key]:
-                    if other.effective_from < label.effective_to and other.effective_to > label.effective_from:
-                        failed.append({'id': lid, 'reason': f'与本次同批通过的价签(ID:{other.id})生效时段重叠'})
-                        batch_overlap = True
-                        break
-            if batch_overlap:
-                continue
-
-            if key not in approved_set:
-                approved_set[key] = []
-            approved_set[key].append(label)
-
-        for key, labels in approved_set.items():
-            for label in labels:
-                label.status = 'published'
-                label.approved_at = now
-                label.approved_by = user.id
-                label.published_at = now
-                label.published_by = user.id
-
-                pq = PrintQueue(
-                    label_id=label.id,
-                    store=label.store,
-                    sku=label.sku,
-                    original_price=label.original_price,
-                    promotion_price=label.promotion_price,
-                    effective_from=label.effective_from,
-                    effective_to=label.effective_to,
-                    template=label.template
-                )
-                db.session.add(pq)
-                success_count += 1
+            pq = PrintQueue(
+                label_id=label.id,
+                store=label.store,
+                sku=label.sku,
+                original_price=label.original_price,
+                promotion_price=label.promotion_price,
+                effective_from=label.effective_from,
+                effective_to=label.effective_to,
+                template=label.template
+            )
+            db.session.add(pq)
+            success_count += 1
     else:
         for lid in label_ids:
             label = PriceLabel.query.get(lid)
@@ -662,6 +625,111 @@ def approve_labels():
             'failed': failed
         }
     })
+
+
+@app.route('/api/labels/precheck', methods=['POST'])
+@require_roles('admin')
+def precheck_labels():
+    data = request.get_json() or {}
+    label_ids = data.get('label_ids', [])
+    if not label_ids:
+        return jsonify({'success': False, 'message': '未选择价签'})
+
+    check_results = check_publish_approval(label_ids)
+
+    publishable = []
+    conflict = []
+    config_restricted = []
+
+    for lid in label_ids:
+        r = check_results.get(lid)
+        if not r:
+            item = {
+                'label_id': lid, 'sku': '', 'store': '',
+                'effective_from': '', 'effective_to': '',
+                'risk_reason': '价签不存在', 'suggested_action': '检查价签ID是否正确',
+            }
+            config_restricted.append(item)
+            continue
+        item = {
+            'label_id': r['label_id'],
+            'sku': r['sku'],
+            'store': r['store'],
+            'effective_from': r['effective_from'],
+            'effective_to': r['effective_to'],
+            'risk_reason': r['risk_reason'],
+            'suggested_action': r['suggested_action'],
+        }
+        group = r['group']
+        if group == 'publishable':
+            publishable.append(item)
+        elif group == 'conflict':
+            conflict.append(item)
+        else:
+            config_restricted.append(item)
+
+    return jsonify({
+        'success': True,
+        'data': {
+            'publishable': publishable,
+            'conflict': conflict,
+            'config_restricted': config_restricted,
+            'total': len(label_ids),
+            'publishable_count': len(publishable),
+            'conflict_count': len(conflict),
+            'config_restricted_count': len(config_restricted),
+        }
+    })
+
+
+@app.route('/api/export/precheck', methods=['POST'])
+@require_roles('admin')
+def export_precheck():
+    data = request.get_json() or {}
+    label_ids = data.get('label_ids', [])
+    if not label_ids:
+        return jsonify({'success': False, 'message': '未选择价签'})
+
+    check_results = check_publish_approval(label_ids)
+
+    group_map = {
+        'publishable': '可发布',
+        'conflict': '冲突',
+        'config_restricted': '配置限制',
+    }
+
+    rows = []
+    for lid in label_ids:
+        r = check_results.get(lid)
+        if not r:
+            rows.append({
+                '价签ID': lid, 'SKU': '', '门店': '',
+                '生效开始时间': '', '生效结束时间': '',
+                '分组': '配置限制',
+                '风险原因': '价签不存在',
+                '建议动作': '检查价签ID是否正确',
+            })
+            continue
+        rows.append({
+            '价签ID': r['label_id'],
+            'SKU': r['sku'],
+            '门店': r['store'],
+            '生效开始时间': r['effective_from'],
+            '生效结束时间': r['effective_to'],
+            '分组': group_map.get(r['group'], r['group']),
+            '风险原因': r['risk_reason'] or '无',
+            '建议动作': r['suggested_action'],
+        })
+
+    df = pd.DataFrame(rows)
+    output = StringIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
+    output.seek(0)
+
+    resp = make_response(output.getvalue())
+    resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename=precheck_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
+    return resp
 
 
 @app.route('/api/labels/<int:label_id>/rollback', methods=['POST'])
@@ -1037,7 +1105,7 @@ def stats_overview():
             'rolled_back': rolled_back,
             'pending_print': pending_print,
             'rollback_count': rollback_count,
-            'in_publish_window': is_in_publish_window()
+            'in_publish_window': is_in_publish_window()[0]
         }
     })
 

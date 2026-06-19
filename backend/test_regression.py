@@ -44,6 +44,18 @@ def get(opener, path):
             return {'success': False, 'message': str(e), 'code': e.code}
 
 
+def put(opener, path, data):
+    req = urllib.request.Request(BASE_URL + path, data=json.dumps(data).encode('utf-8'), method='PUT')
+    req.add_header('Content-Type', 'application/json')
+    try:
+        return json.loads(opener.open(req).read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode('utf-8'))
+        except Exception:
+            return {'success': False, 'message': str(e), 'code': e.code}
+
+
 def download(opener, path):
     req = urllib.request.Request(BASE_URL + path)
     try:
@@ -99,6 +111,16 @@ section('前置：登录 admin')
 admin = make_opener()
 r = post(admin, '/api/auth/login', {'username': 'admin', 'password': 'admin123'})
 assert_true('admin 登录成功', r.get('success'), r.get('message'))
+
+r = put(admin, '/api/config', {
+    'publish_window': json.dumps({
+        'enabled': False,
+        'start_hour': 0,
+        'end_hour': 24,
+        'weekdays_only': False,
+    })
+})
+assert_true('关闭发布窗口限制', r.get('success'))
 
 # ============================================================
 section('测试1：待审冲突发布拦截')

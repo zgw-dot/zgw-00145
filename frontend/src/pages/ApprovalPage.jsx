@@ -1,18 +1,61 @@
 import React, { useState, useEffect } from 'react'
 import {
   Table, Tag, Space, Card, Button, Input, Select, App as AntApp,
-  Typography, Modal, Checkbox,
+  Typography, Modal, Checkbox, Tabs, Spin,
 } from 'antd'
 import {
   SearchOutlined, CheckCircleOutlined, CloseCircleOutlined,
-  ReloadOutlined, AuditOutlined,
+  ReloadOutlined, AuditOutlined, SafetyCertificateOutlined,
+  DownloadOutlined, ExclamationCircleOutlined, StopOutlined,
 } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import dayjs from 'dayjs'
 import api from '../utils/api.js'
 
-const { Title } = Typography
+const { Title, Text } = Typography
 const { TextArea } = Input
+
+const precheckColumns = [
+  {
+    title: '价签ID',
+    dataIndex: 'label_id',
+    key: 'label_id',
+    width: 80,
+  },
+  {
+    title: 'SKU',
+    dataIndex: 'sku',
+    key: 'sku',
+    width: 120,
+    render: (v) => <span style={{ fontFamily: 'monospace' }}>{v}</span>,
+  },
+  { title: '门店', dataIndex: 'store', key: 'store', width: 120 },
+  {
+    title: '生效时段',
+    key: 'period',
+    width: 240,
+    render: (_, r) => (
+      <div style={{ fontSize: 12 }}>
+        <div><Tag color="green">起</Tag>{r.effective_from ? dayjs(r.effective_from).format('YYYY-MM-DD HH:mm') : '-'}</div>
+        <div style={{ marginTop: 2 }}><Tag color="red">止</Tag>{r.effective_to ? dayjs(r.effective_to).format('YYYY-MM-DD HH:mm') : '-'}</div>
+      </div>
+    ),
+  },
+  {
+    title: '风险原因',
+    dataIndex: 'risk_reason',
+    key: 'risk_reason',
+    width: 260,
+    render: (v) => v || <Text type="secondary">无</Text>,
+  },
+  {
+    title: '建议动作',
+    dataIndex: 'suggested_action',
+    key: 'suggested_action',
+    width: 220,
+    render: (v) => v || '-',
+  },
+]
 
 export default function ApprovalPage({ user }) {
   const navigate = useNavigate()
@@ -24,6 +67,9 @@ export default function ApprovalPage({ user }) {
   const [selectedRowKeys, setSelectedRowKeys] = useState([])
   const [rejectOpen, setRejectOpen] = useState(false)
   const [rejectReason, setRejectReason] = useState('')
+  const [precheckOpen, setPrecheckOpen] = useState(false)
+  const [precheckLoading, setPrecheckLoading] = useState(false)
+  const [precheckResult, setPrecheckResult] = useState(null)
 
   const isAdmin = user?.role === 'admin'
 
@@ -94,6 +140,63 @@ export default function ApprovalPage({ user }) {
     })
   }
 
+  const handlePrecheck = async () => {
+    if (selectedRowKeys.length === 0) {
+      message.warning('请先选择要预检的价签')
+      return
+    }
+    setPrecheckOpen(true)
+    setPrecheckLoading(true)
+    setPrecheckResult(null)
+    try {
+      const res = await api.post('/labels/precheck', {
+        label_ids: selectedRowKeys,
+      })
+      setPrecheckResult(res.data)
+    } catch (err) {
+      message.error(err.message)
+    } finally {
+      setPrecheckLoading(false)
+    }
+  }
+
+  const handleExportPrecheck = async () => {
+    if (selectedRowKeys.length === 0) {
+      message.warning('请先选择要导出的价签')
+      return
+    }
+    try {
+      const res = await fetch('/api/export/precheck', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        credentials: 'include',
+        body: JSON.stringify({ label_ids: selectedRowKeys }),
+      })
+      if (!res.ok) {
+        const errData = await res.json()
+        throw new Error(errData.message || '导出失败')
+      }
+      const blob = await res.blob()
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const disposition = res.headers.get('Content-Disposition')
+      const filename = disposition
+        ? disposition.split('filename=')[1]?.replace(/"/g, '')
+        : `precheck_${dayjs().format('YYYYMMDDHHmmss')}.csv`
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      window.URL.revokeObjectURL(url)
+      message.success('导出成功')
+    } catch (err) {
+      message.error(err.message)
+    }
+  }
+
   const columns = [
     {
       title: 'SKU',
@@ -162,6 +265,69 @@ export default function ApprovalPage({ user }) {
     },
   ]
 
+  const precheckTabs = precheckResult ? [
+    {
+      key: 'publishable',
+      label: (
+        <span>
+          <SafetyCertificateOutlined style={{ color: '#52c41a' }} />
+          可发布 ({precheckResult.publishable_count})
+        </span>
+      ),
+      children: (
+        <Table
+          rowKey="label_id"
+          columns={precheckColumns}
+          dataSource={precheckResult.publishable}
+          pagination={false}
+          size="small"
+          scroll={{ x: 900 }}
+          locale={{ emptyText: '暂无' }}
+        />
+      ),
+    },
+    {
+      key: 'conflict',
+      label: (
+        <span>
+          <ExclamationCircleOutlined style={{ color: '#faad14' }} />
+          冲突 ({precheckResult.conflict_count})
+        </span>
+      ),
+      children: (
+        <Table
+          rowKey="label_id"
+          columns={precheckColumns}
+          dataSource={precheckResult.conflict}
+          pagination={false}
+          size="small"
+          scroll={{ x: 900 }}
+          locale={{ emptyText: '暂无' }}
+        />
+      ),
+    },
+    {
+      key: 'config_restricted',
+      label: (
+        <span>
+          <StopOutlined style={{ color: '#ff4d4f' }} />
+          配置限制 ({precheckResult.config_restricted_count})
+        </span>
+      ),
+      children: (
+        <Table
+          rowKey="label_id"
+          columns={precheckColumns}
+          dataSource={precheckResult.config_restricted}
+          pagination={false}
+          size="small"
+          scroll={{ x: 900 }}
+          locale={{ emptyText: '暂无' }}
+        />
+      ),
+    },
+  ] : []
+
   return (
     <div>
       <div className="action-bar">
@@ -170,6 +336,13 @@ export default function ApprovalPage({ user }) {
         </Title>
         {isAdmin ? (
           <Space>
+            <Button
+              icon={<SafetyCertificateOutlined />}
+              disabled={selectedRowKeys.length === 0}
+              onClick={handlePrecheck}
+            >
+              发布预检 ({selectedRowKeys.length})
+            </Button>
             <Button
               danger
               icon={<CloseCircleOutlined />}
@@ -271,6 +444,50 @@ export default function ApprovalPage({ user }) {
           showCount
           maxLength={200}
         />
+      </Modal>
+
+      <Modal
+        title={
+          <Space>
+            <SafetyCertificateOutlined style={{ color: '#1677ff' }} />
+            <span>发布预检结果</span>
+          </Space>
+        }
+        open={precheckOpen}
+        onCancel={() => { setPrecheckOpen(false); setPrecheckResult(null) }}
+        width={960}
+        footer={[
+          <Button key="export" icon={<DownloadOutlined />} onClick={handleExportPrecheck} disabled={!precheckResult}>
+            导出 CSV
+          </Button>,
+          <Button key="close" onClick={() => { setPrecheckOpen(false); setPrecheckResult(null) }}>
+            关闭
+          </Button>,
+        ]}
+      >
+        {precheckLoading ? (
+          <div style={{ textAlign: 'center', padding: '40px 0' }}>
+            <Spin size="large" tip="正在预检..." />
+          </div>
+        ) : precheckResult ? (
+          <div>
+            <div style={{ marginBottom: 16, display: 'flex', gap: 16 }}>
+              <Card size="small" style={{ flex: 1, background: '#f6ffed', borderColor: '#b7eb8f' }}>
+                <Text type="success" strong style={{ fontSize: 20 }}>{precheckResult.publishable_count}</Text>
+                <div><Text type="secondary">可发布</Text></div>
+              </Card>
+              <Card size="small" style={{ flex: 1, background: '#fffbe6', borderColor: '#ffe58f' }}>
+                <Text style={{ color: '#faad14', fontSize: 20, fontWeight: 600 }}>{precheckResult.conflict_count}</Text>
+                <div><Text type="secondary">冲突</Text></div>
+              </Card>
+              <Card size="small" style={{ flex: 1, background: '#fff2f0', borderColor: '#ffccc7' }}>
+                <Text danger strong style={{ fontSize: 20 }}>{precheckResult.config_restricted_count}</Text>
+                <div><Text type="secondary">配置限制</Text></div>
+              </Card>
+            </div>
+            <Tabs items={precheckTabs} />
+          </div>
+        ) : null}
       </Modal>
     </div>
   )
