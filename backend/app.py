@@ -191,12 +191,17 @@ def validate_label_row(row, discount_floor, store_whitelist, check_overlap=True)
         overlap = PriceLabel.query.filter(
             PriceLabel.sku == sku,
             PriceLabel.store == store,
-            PriceLabel.status.in_(['pending_approval', 'published']),
+            PriceLabel.status.in_(['pending_approval', 'published', 'revoking']),
             PriceLabel.effective_from < effective_to,
             PriceLabel.effective_to > effective_from
         ).first()
         if overlap:
-            errors.append(f'与已有价签(ID:{overlap.id})生效时段重叠')
+            status_label = {
+                'pending_approval': '待审批',
+                'published': '已发布',
+                'revoking': '撤销中'
+            }.get(overlap.status, overlap.status)
+            errors.append(f'与已有价签(ID:{overlap.id}, {status_label})生效时段重叠')
 
     return {
         'is_valid': len(errors) == 0,

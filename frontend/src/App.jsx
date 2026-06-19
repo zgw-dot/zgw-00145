@@ -23,6 +23,7 @@ import ApprovalPage from './pages/ApprovalPage.jsx'
 import PrintQueue from './pages/PrintQueue.jsx'
 import RollbackHistoryPage from './pages/RollbackHistoryPage.jsx'
 import RevocationLogPage from './pages/RevocationLogPage.jsx'
+import RevocationApprovalPage from './pages/RevocationApprovalPage.jsx'
 import ConfigPage from './pages/ConfigPage.jsx'
 import api from './utils/api.js'
 
@@ -33,6 +34,7 @@ const menuItems = [
   { key: '/import', icon: <ImportOutlined />, label: '导入批次' },
   { key: '/labels', icon: <UnorderedListOutlined />, label: '价签管理' },
   { key: '/approval', icon: <AuditOutlined />, label: '价签审批' },
+  { key: '/revocation-approval', icon: <StopOutlined />, label: '撤销审批', roles: ['admin'] },
   { key: '/print-queue', icon: <PrinterOutlined />, label: '打印清单' },
   { key: '/rollback-history', icon: <HistoryOutlined />, label: '回滚历史' },
   { key: '/revocation-logs', icon: <StopOutlined />, label: '撤销日志' },
@@ -133,6 +135,7 @@ function AppContent() {
               <Route path="/labels" element={<LabelList user={user} />} />
               <Route path="/labels/:id" element={<LabelDetail user={user} />} />
               <Route path="/approval" element={<ApprovalPage user={user} />} />
+              <Route path="/revocation-approval" element={<RevocationApprovalPage user={user} />} />
               <Route path="/print-queue" element={<PrintQueue user={user} />} />
               <Route path="/rollback-history" element={<RollbackHistoryPage />} />
               <Route path="/revocation-logs" element={<RevocationLogPage />} />

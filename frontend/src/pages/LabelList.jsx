@@ -118,18 +118,30 @@ export default function LabelList({ user }) {
   }
 
   const handleBatchRevokeRequest = () => {
-    const candidates = data.filter(d => selectedRowKeys.includes(d.id) && (d.status === 'published' || d.status === 'revoking'))
-    if (candidates.length === 0) {
-      message.warning('请选择至少一条已发布或撤销中的价签')
+    const candidates = data.filter(d => selectedRowKeys.includes(d.id) && d.status === 'published')
+    const revokingSelected = data.filter(d => selectedRowKeys.includes(d.id) && d.status === 'revoking')
+    if (candidates.length === 0 && revokingSelected.length === 0) {
+      message.warning('请选择至少一条已发布的价签')
       return
     }
+    if (revokingSelected.length > 0) {
+      message.warning(`已筛选出 ${revokingSelected.length} 条撤销中状态的价签，将跳过`)
+    }
+    if (candidates.length === 0) {
+      return
+    }
+    setSelectedRowKeys(candidates.map(c => c.id))
     setRevokeRequestReason('')
     setRevokeRequestModalOpen(true)
   }
 
   const handleSingleRevokeRequest = (record) => {
-    if (record.status !== 'published' && record.status !== 'revoking') {
-      message.warning('只有已发布或撤销中的价签可以申请撤销')
+    if (record.status === 'revoking') {
+      message.warning('该价签已有撤销申请处理中，请等待管理员审批')
+      return
+    }
+    if (record.status !== 'published') {
+      message.warning('只有已发布的价签可以申请撤销')
       return
     }
     setSelectedRowKeys([record.id])
@@ -271,9 +283,14 @@ export default function LabelList({ user }) {
           <Button type="link" size="small" icon={<EyeOutlined />} onClick={() => navigate(`/labels/${r.id}`)}>
             详情
           </Button>
-          {canRevokeRequest && (r.status === 'published' || r.status === 'revoking') && (
+          {canRevokeRequest && r.status === 'published' && (
             <Button type="link" size="small" danger onClick={() => handleSingleRevokeRequest(r)}>
               申请撤销
+            </Button>
+          )}
+          {canRevokeRequest && r.status === 'revoking' && (
+            <Button type="link" size="small" disabled>
+              撤销中...
             </Button>
           )}
         </Space>
@@ -295,10 +312,10 @@ export default function LabelList({ user }) {
             <Button
               danger
               icon={<StopOutlined />}
-              disabled={selectedRowKeys.length === 0}
+              disabled={data.filter(d => selectedRowKeys.includes(d.id) && d.status === 'published').length === 0}
               onClick={handleBatchRevokeRequest}
             >
-              申请撤销 ({data.filter(d => selectedRowKeys.includes(d.id) && (d.status === 'published' || d.status === 'revoking')).length})
+              申请撤销 ({data.filter(d => selectedRowKeys.includes(d.id) && d.status === 'published').length})
             </Button>
           )}
           {canDirectRevoke && (
@@ -375,7 +392,7 @@ export default function LabelList({ user }) {
           rowSelection={canSubmit || canDirectRevoke || canRevokeRequest ? {
             selectedRowKeys,
             onChange: setSelectedRowKeys,
-            getCheckboxProps: (r) => ({ disabled: r.status !== 'draft' && r.status !== 'published' && r.status !== 'revoking' }),
+            getCheckboxProps: (r) => ({ disabled: r.status !== 'draft' && r.status !== 'published' }),
           } : undefined}
           pagination={{
             ...pagination,

@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import {
   Descriptions, Tag, Space, Card, Button, App as AntApp, Typography,
-  Modal, Form, Select, Input, Table, Timeline, Divider, Row, Col,
+  Modal, Form, Select, Input, Table, Timeline, Divider, Row, Col, Tooltip,
 } from 'antd'
 import {
   ArrowLeftOutlined, UndoOutlined, CheckCircleOutlined, EyeOutlined,
@@ -143,7 +143,7 @@ export default function LabelDetail({ user }) {
           </Space>
         </div>
         <Space>
-          {(label.status === 'published' || label.status === 'revoking') && canRevokeRequest && (
+          {label.status === 'published' && canRevokeRequest && (
             <Button
               danger
               icon={<StopOutlined />}
@@ -151,6 +151,17 @@ export default function LabelDetail({ user }) {
             >
               申请撤销
             </Button>
+          )}
+          {label.status === 'revoking' && canRevokeRequest && (
+            <Tooltip title="撤销申请处理中，请等待管理员审批">
+              <Button
+                danger
+                icon={<ClockCircleOutlined />}
+                disabled
+              >
+                撤销申请处理中
+              </Button>
+            </Tooltip>
           )}
           {label.status === 'published' && canDirectRevoke && (
             <Button
@@ -281,6 +292,60 @@ export default function LabelDetail({ user }) {
                   { title: '操作人ID', dataIndex: 'operated_by', width: 90, align: 'center' },
                 ]}
               />
+            </Card>
+          )}
+
+          {data.revocation_requests?.length > 0 && (
+            <Card
+              title={
+                <Space>
+                  <ClockCircleOutlined style={{ color: '#faad14' }} />
+                  <span>撤销申请进度</span>
+                  {data.revocation_requests[0]?.status === 'pending' && (
+                    <Tag color="processing" style={{ marginLeft: 8 }}>处理中</Tag>
+                  )}
+                </Space>
+              }
+              size="small"
+              style={{ marginTop: 16, background: data.revocation_requests[0]?.status === 'pending' ? '#fffbe6' : undefined, borderColor: data.revocation_requests[0]?.status === 'pending' ? '#ffe58f' : undefined }}
+            >
+              <div style={{ marginBottom: 12 }}>
+                <Text strong>最近一次撤销申请：</Text>
+              </div>
+              <Descriptions column={1} bordered size="small">
+                <Descriptions.Item label="申请状态">
+                  {data.revocation_requests[0]?.status === 'pending' && <Tag color="processing">待处理</Tag>}
+                  {data.revocation_requests[0]?.status === 'approved' && <Tag color="success">已通过</Tag>}
+                  {data.revocation_requests[0]?.status === 'rejected' && <Tag color="error">已驳回</Tag>}
+                </Descriptions.Item>
+                <Descriptions.Item label="申请原因">
+                  {data.revocation_requests[0]?.reason || '-'}
+                </Descriptions.Item>
+                <Descriptions.Item label="申请时间">
+                  {data.revocation_requests[0]?.requested_at ? dayjs(data.revocation_requests[0].requested_at).format('YYYY-MM-DD HH:mm:ss') : '-'}
+                </Descriptions.Item>
+                <Descriptions.Item label="申请人">
+                  {data.revocation_requests[0]?.requested_by_name || `ID:${data.revocation_requests[0]?.requested_by}`}
+                </Descriptions.Item>
+                {data.revocation_requests[0]?.status !== 'pending' && (
+                  <>
+                    <Descriptions.Item label="处理时间">
+                      {data.revocation_requests[0]?.reviewed_at ? dayjs(data.revocation_requests[0].reviewed_at).format('YYYY-MM-DD HH:mm:ss') : '-'}
+                    </Descriptions.Item>
+                    <Descriptions.Item label="处理人">
+                      {data.revocation_requests[0]?.reviewed_by_name || `ID:${data.revocation_requests[0]?.reviewed_by}`}
+                    </Descriptions.Item>
+                    <Descriptions.Item label="处理意见">
+                      {data.revocation_requests[0]?.review_comment || '-'}
+                    </Descriptions.Item>
+                    {data.revocation_requests[0]?.offline_processing_note && (
+                      <Descriptions.Item label="线下处理说明">
+                        {data.revocation_requests[0].offline_processing_note}
+                      </Descriptions.Item>
+                    )}
+                  </>
+                )}
+              </Descriptions>
             </Card>
           )}
 

@@ -85,16 +85,20 @@ def check_publish_approval(label_ids):
             PriceLabel.sku == label.sku,
             PriceLabel.store == label.store,
             PriceLabel.id != label.id,
-            PriceLabel.status.in_(['published']),
+            PriceLabel.status.in_(['published', 'revoking']),
             PriceLabel.effective_from < label.effective_to,
             PriceLabel.effective_to > label.effective_from
         ).first()
         if overlap_db:
+            status_label = {
+                'published': '已发布',
+                'revoking': '撤销中'
+            }.get(overlap_db.status, overlap_db.status)
             results[lid] = {
                 **info,
                 'group': 'conflict',
-                'risk_reason': f'与已发布价签(ID:{overlap_db.id})同门店同SKU生效时段重叠',
-                'suggested_action': f'回滚或调整已发布价签(ID:{overlap_db.id})的时段后再审批',
+                'risk_reason': f'与{status_label}价签(ID:{overlap_db.id})同门店同SKU生效时段重叠',
+                'suggested_action': f'处理或调整{status_label}价签(ID:{overlap_db.id})的时段后再审批',
             }
             continue
 

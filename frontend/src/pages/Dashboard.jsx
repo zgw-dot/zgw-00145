@@ -100,6 +100,15 @@ export default function Dashboard() {
               <StatCard title="撤销次数" value={stats.revocation_count} color="#8c8c8c" icon={<StopOutlined />} path="/revocation-logs" />
             </Col>
             <Col xs={24} sm={12} md={8} lg={6}>
+              <StatCard
+                title="待处理撤销申请"
+                value={stats.revocation_request_pending}
+                color="#fa8c16"
+                icon={<ClockCircleOutlined />}
+                path="/revocation-approval"
+              />
+            </Col>
+            <Col xs={24} sm={12} md={8} lg={6}>
               <Card
                 className="stat-card"
                 styles={{ body: { padding: '24px 16px' } }}
