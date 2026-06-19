@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta
 from io import StringIO
 
-from flask import Flask, request, jsonify, send_file, g, session
+from flask import Flask, request, jsonify, send_file, g, session, make_response
 from flask_cors import CORS
 import pandas as pd
 from dateutil import parser as date_parser
@@ -581,39 +581,78 @@ def approve_labels():
     success_count = 0
     failed = []
 
-    for lid in label_ids:
-        label = PriceLabel.query.get(lid)
-        if not label:
-            failed.append({'id': lid, 'reason': '价签不存在'})
-            continue
-        if label.status != 'pending_approval':
-            failed.append({'id': lid, 'reason': f'状态为{label.status}，不能审批'})
-            continue
+    if approve:
+        approved_set = {}
 
-        if approve:
-            label.status = 'published'
-            label.approved_at = now
-            label.approved_by = user.id
-            label.published_at = now
-            label.published_by = user.id
+        for lid in label_ids:
+            label = PriceLabel.query.get(lid)
+            if not label:
+                failed.append({'id': lid, 'reason': '价签不存在'})
+                continue
+            if label.status != 'pending_approval':
+                failed.append({'id': lid, 'reason': f'状态为{label.status}，不能审批'})
+                continue
 
-            pq = PrintQueue(
-                label_id=label.id,
-                store=label.store,
-                sku=label.sku,
-                original_price=label.original_price,
-                promotion_price=label.promotion_price,
-                effective_from=label.effective_from,
-                effective_to=label.effective_to,
-                template=label.template
-            )
-            db.session.add(pq)
-        else:
+            overlap_db = PriceLabel.query.filter(
+                PriceLabel.sku == label.sku,
+                PriceLabel.store == label.store,
+                PriceLabel.id != label.id,
+                PriceLabel.status == 'published',
+                PriceLabel.effective_from < label.effective_to,
+                PriceLabel.effective_to > label.effective_from
+            ).first()
+            if overlap_db:
+                failed.append({'id': lid, 'reason': f'与已发布价签(ID:{overlap_db.id})生效时段重叠'})
+                continue
+
+            key = f'{label.store}|{label.sku}'
+            batch_overlap = False
+            if key in approved_set:
+                for other in approved_set[key]:
+                    if other.effective_from < label.effective_to and other.effective_to > label.effective_from:
+                        failed.append({'id': lid, 'reason': f'与本次同批通过的价签(ID:{other.id})生效时段重叠'})
+                        batch_overlap = True
+                        break
+            if batch_overlap:
+                continue
+
+            if key not in approved_set:
+                approved_set[key] = []
+            approved_set[key].append(label)
+
+        for key, labels in approved_set.items():
+            for label in labels:
+                label.status = 'published'
+                label.approved_at = now
+                label.approved_by = user.id
+                label.published_at = now
+                label.published_by = user.id
+
+                pq = PrintQueue(
+                    label_id=label.id,
+                    store=label.store,
+                    sku=label.sku,
+                    original_price=label.original_price,
+                    promotion_price=label.promotion_price,
+                    effective_from=label.effective_from,
+                    effective_to=label.effective_to,
+                    template=label.template
+                )
+                db.session.add(pq)
+                success_count += 1
+    else:
+        for lid in label_ids:
+            label = PriceLabel.query.get(lid)
+            if not label:
+                failed.append({'id': lid, 'reason': '价签不存在'})
+                continue
+            if label.status != 'pending_approval':
+                failed.append({'id': lid, 'reason': f'状态为{label.status}，不能审批'})
+                continue
             label.status = 'draft'
             if reject_reason:
                 label.rollback_reason = f'驳回原因: {reject_reason}'
-
-        success_count += 1
+            success_count += 1
 
     db.session.commit()
     return jsonify({
@@ -682,6 +721,7 @@ def rollback_label(label_id):
             return jsonify({'success': False, 'message': f'回滚后与价签(ID:{overlap.id})生效时段重叠'})
 
         db.session.add(new_version)
+        db.session.flush()
 
         label.status = 'rolled_back'
         label.rolled_back_at = now
@@ -814,6 +854,13 @@ def list_rollback_history():
 
 
 # ==================== 导出接口 ====================
+def _get_username(user_id):
+    if not user_id:
+        return ''
+    u = User.query.get(user_id)
+    return u.username if u else ''
+
+
 @app.route('/api/export/labels', methods=['GET'])
 @require_login
 def export_labels():
@@ -829,12 +876,20 @@ def export_labels():
     if store:
         query = query.filter(PriceLabel.store.like(f'%{store}%'))
 
-    labels = query.order_by(PriceLabel.created_at.desc()).all()
+    labels = query.order_by(PriceLabel.store, PriceLabel.sku, PriceLabel.version).all()
+
+    status_map = {
+        'draft': '草稿',
+        'pending_approval': '待审',
+        'published': '已发布',
+        'rolled_back': '已回滚'
+    }
 
     rows = []
     for l in labels:
         rows.append({
             'ID': l.id,
+            '版本号': l.version,
             'SKU': l.sku,
             '门店': l.store,
             '原价': l.original_price,
@@ -843,22 +898,27 @@ def export_labels():
             '生效开始时间': l.effective_from.strftime('%Y-%m-%d %H:%M:%S'),
             '生效结束时间': l.effective_to.strftime('%Y-%m-%d %H:%M:%S'),
             '模板': l.template,
-            '状态': {
-                'draft': '草稿',
-                'pending_approval': '待审',
-                'published': '已发布',
-                'rolled_back': '已回滚'
-            }.get(l.status, l.status),
-            '版本': l.version,
-            '创建时间': l.created_at.strftime('%Y-%m-%d %H:%M:%S')
+            '状态': status_map.get(l.status, l.status),
+            '创建人': _get_username(l.created_by),
+            '创建时间': l.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+            '提交时间': l.submitted_at.strftime('%Y-%m-%d %H:%M:%S') if l.submitted_at else '',
+            '审批人': _get_username(l.approved_by),
+            '审批时间': l.approved_at.strftime('%Y-%m-%d %H:%M:%S') if l.approved_at else '',
+            '发布人': _get_username(l.published_by),
+            '发布时间': l.published_at.strftime('%Y-%m-%d %H:%M:%S') if l.published_at else '',
+            '是否回滚': '是' if l.status == 'rolled_back' else '否',
+            '回滚人': _get_username(l.rolled_back_by),
+            '回滚时间': l.rolled_back_at.strftime('%Y-%m-%d %H:%M:%S') if l.rolled_back_at else '',
+            '回滚原因': l.rollback_reason or '',
+            '上一版本ID': l.previous_version_id or '',
+            '关联批次ID': l.batch_id or '',
         })
 
     df = pd.DataFrame(rows)
     output = StringIO()
-    df.to_csv(output, index=False, encoding='utf-8-sig')
+    df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
     output.seek(0)
 
-    from flask import make_response
     resp = make_response(output.getvalue())
     resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
     resp.headers['Content-Disposition'] = f'attachment; filename=labels_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
@@ -897,13 +957,61 @@ def export_print_queue():
 
     df = pd.DataFrame(rows)
     output = StringIO()
-    df.to_csv(output, index=False, encoding='utf-8-sig')
+    df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
     output.seek(0)
 
-    from flask import make_response
     resp = make_response(output.getvalue())
     resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
     resp.headers['Content-Disposition'] = f'attachment; filename=print_queue_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
+    return resp
+
+
+@app.route('/api/export/rollback-history', methods=['GET'])
+@require_login
+def export_rollback_history():
+    sku = request.args.get('sku', '')
+    store = request.args.get('store', '')
+
+    query = RollbackHistory.query.join(PriceLabel, RollbackHistory.label_id == PriceLabel.id)
+    if sku:
+        query = query.filter(PriceLabel.sku.like(f'%{sku}%'))
+    if store:
+        query = query.filter(PriceLabel.store.like(f'%{store}%'))
+
+    records = query.order_by(RollbackHistory.created_at.desc()).all()
+
+    status_map = {
+        'draft': '草稿',
+        'pending_approval': '待审',
+        'published': '已发布',
+        'rolled_back': '已回滚'
+    }
+
+    rows = []
+    for r in records:
+        rows.append({
+            '记录ID': r.id,
+            '价签ID': r.label_id,
+            'SKU': r.label.sku if r.label else '',
+            '门店': r.label.store if r.label else '',
+            '从版本': r.from_version,
+            '到版本': r.to_version,
+            '从状态': status_map.get(r.from_status, r.from_status or ''),
+            '到状态': status_map.get(r.to_status, r.to_status or ''),
+            '回滚方式': '回滚到历史版本' if r.from_version != r.to_version else '直接标记回滚',
+            '回滚原因': r.reason or '',
+            '操作人': _get_username(r.operated_by),
+            '操作时间': r.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+        })
+
+    df = pd.DataFrame(rows)
+    output = StringIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
+    output.seek(0)
+
+    resp = make_response(output.getvalue())
+    resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename=rollback_history_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
     return resp
 
 

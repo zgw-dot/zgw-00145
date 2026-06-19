@@ -3,7 +3,7 @@ import {
   Table, Tag, Space, Card, Button, Input, App as AntApp,
   Typography,
 } from 'antd'
-import { SearchOutlined, ReloadOutlined, UndoOutlined } from '@ant-design/icons'
+import { SearchOutlined, ReloadOutlined, UndoOutlined, DownloadOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import dayjs from 'dayjs'
 import api from '../utils/api.js'
@@ -36,6 +36,15 @@ export default function RollbackHistoryPage() {
     } finally {
       setLoading(false)
     }
+  }
+
+  const handleExport = () => {
+    const params = new URLSearchParams({
+      sku: filters.sku,
+      store: filters.store,
+    })
+    window.open(`/api/export/rollback-history?${params}`, '_blank')
+    message.success('已开始导出')
   }
 
   const STATUS_MAP = {
@@ -153,6 +162,9 @@ export default function RollbackHistoryPage() {
               }}
             >
               重置
+            </Button>
+            <Button type="primary" icon={<DownloadOutlined />} onClick={handleExport}>
+              导出 CSV
             </Button>
           </Space>
         </div>
