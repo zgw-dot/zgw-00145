@@ -80,7 +80,7 @@ class PriceLabel(db.Model):
     effective_from = db.Column(db.DateTime, nullable=False)
     effective_to = db.Column(db.DateTime, nullable=False)
     template = db.Column(db.String(100), nullable=False)
-    status = db.Column(db.String(20), default='draft')  # draft, pending_approval, published, rolled_back, revoked
+    status = db.Column(db.String(20), default='draft')  # draft, pending_approval, published, revoking, rolled_back, revoked
     version = db.Column(db.Integer, default=1)
     batch_id = db.Column(db.Integer, db.ForeignKey('import_batches.id'))
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
@@ -218,6 +218,77 @@ class RevocationLog(db.Model):
             'label_id': self.label_id,
             'sku': self.sku,
             'store': self.store,
+            'original_status': self.original_status,
+            'reason': self.reason,
+            'operated_by': self.operated_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'affected_print_queue_ids': self.affected_print_queue_ids,
+        }
+
+
+class RevocationRequest(db.Model):
+    __tablename__ = 'revocation_requests'
+    id = db.Column(db.Integer, primary_key=True)
+    label_id = db.Column(db.Integer, db.ForeignKey('price_labels.id'), nullable=False)
+    sku = db.Column(db.String(100), nullable=False)
+    store = db.Column(db.String(100), nullable=False)
+    original_status = db.Column(db.String(20), nullable=False)
+    reason = db.Column(db.Text, nullable=False)
+    status = db.Column(db.String(20), default='pending')  # pending, approved, rejected
+    offline_processing_note = db.Column(db.Text)
+    requested_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    requested_at = db.Column(db.DateTime, default=datetime.utcnow)
+    reviewed_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    reviewed_at = db.Column(db.DateTime)
+    review_comment = db.Column(db.Text)
+    affected_print_queue_ids = db.Column(db.Text)
+
+    label = db.relationship('PriceLabel', foreign_keys=[label_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'label_id': self.label_id,
+            'sku': self.sku,
+            'store': self.store,
+            'original_status': self.original_status,
+            'reason': self.reason,
+            'status': self.status,
+            'offline_processing_note': self.offline_processing_note,
+            'requested_by': self.requested_by,
+            'requested_at': self.requested_at.isoformat() if self.requested_at else None,
+            'reviewed_by': self.reviewed_by,
+            'reviewed_at': self.reviewed_at.isoformat() if self.reviewed_at else None,
+            'review_comment': self.review_comment,
+            'affected_print_queue_ids': self.affected_print_queue_ids,
+        }
+
+
+class RevocationRequestLog(db.Model):
+    __tablename__ = 'revocation_request_logs'
+    id = db.Column(db.Integer, primary_key=True)
+    request_id = db.Column(db.Integer, db.ForeignKey('revocation_requests.id'), nullable=False)
+    label_id = db.Column(db.Integer, db.ForeignKey('price_labels.id'), nullable=False)
+    sku = db.Column(db.String(100), nullable=False)
+    store = db.Column(db.String(100), nullable=False)
+    action = db.Column(db.String(20), nullable=False)  # submit, approve, reject
+    original_status = db.Column(db.String(20), nullable=False)
+    reason = db.Column(db.Text)
+    operated_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    affected_print_queue_ids = db.Column(db.Text)
+
+    request = db.relationship('RevocationRequest', foreign_keys=[request_id])
+    label = db.relationship('PriceLabel', foreign_keys=[label_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'request_id': self.request_id,
+            'label_id': self.label_id,
+            'sku': self.sku,
+            'store': self.store,
+            'action': self.action,
             'original_status': self.original_status,
             'reason': self.reason,
             'operated_by': self.operated_by,

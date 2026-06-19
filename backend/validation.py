@@ -85,7 +85,7 @@ def check_publish_approval(label_ids):
             PriceLabel.sku == label.sku,
             PriceLabel.store == label.store,
             PriceLabel.id != label.id,
-            PriceLabel.status == 'published',
+            PriceLabel.status.in_(['published']),
             PriceLabel.effective_from < label.effective_to,
             PriceLabel.effective_to > label.effective_from
         ).first()
