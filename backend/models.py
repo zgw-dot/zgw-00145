@@ -80,7 +80,7 @@ class PriceLabel(db.Model):
     effective_from = db.Column(db.DateTime, nullable=False)
     effective_to = db.Column(db.DateTime, nullable=False)
     template = db.Column(db.String(100), nullable=False)
-    status = db.Column(db.String(20), default='draft')  # draft, pending_approval, published, rolled_back
+    status = db.Column(db.String(20), default='draft')  # draft, pending_approval, published, rolled_back, revoked
     version = db.Column(db.Integer, default=1)
     batch_id = db.Column(db.Integer, db.ForeignKey('import_batches.id'))
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
@@ -94,6 +94,9 @@ class PriceLabel(db.Model):
     rolled_back_by = db.Column(db.Integer, db.ForeignKey('users.id'))
     rollback_reason = db.Column(db.Text)
     previous_version_id = db.Column(db.Integer, db.ForeignKey('price_labels.id'))
+    revoked_at = db.Column(db.DateTime)
+    revoked_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    revoke_reason = db.Column(db.Text)
 
     __table_args__ = (
         db.Index('idx_store_sku', 'store', 'sku'),
@@ -123,6 +126,9 @@ class PriceLabel(db.Model):
                 'rolled_back_at': self.rolled_back_at.isoformat() if self.rolled_back_at else None,
                 'rollback_reason': self.rollback_reason,
                 'previous_version_id': self.previous_version_id,
+                'revoked_at': self.revoked_at.isoformat() if self.revoked_at else None,
+                'revoked_by': self.revoked_by,
+                'revoke_reason': self.revoke_reason,
             })
         return result
 
@@ -189,4 +195,32 @@ class PrintQueue(db.Model):
             'status': self.status,
             'printed_at': self.printed_at.isoformat() if self.printed_at else None,
             'created_at': self.created_at.isoformat()
+        }
+
+
+class RevocationLog(db.Model):
+    __tablename__ = 'revocation_logs'
+    id = db.Column(db.Integer, primary_key=True)
+    label_id = db.Column(db.Integer, db.ForeignKey('price_labels.id'), nullable=False)
+    sku = db.Column(db.String(100), nullable=False)
+    store = db.Column(db.String(100), nullable=False)
+    original_status = db.Column(db.String(20), nullable=False)
+    reason = db.Column(db.Text, nullable=False)
+    operated_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    affected_print_queue_ids = db.Column(db.Text)
+
+    label = db.relationship('PriceLabel', foreign_keys=[label_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'label_id': self.label_id,
+            'sku': self.sku,
+            'store': self.store,
+            'original_status': self.original_status,
+            'reason': self.reason,
+            'operated_by': self.operated_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'affected_print_queue_ids': self.affected_print_queue_ids,
         }

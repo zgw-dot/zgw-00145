@@ -11,7 +11,7 @@ from dateutil import parser as date_parser
 
 from models import (
     db, User, SystemConfig, ImportBatch, ImportValidation,
-    PriceLabel, RollbackHistory, PrintQueue
+    PriceLabel, RollbackHistory, PrintQueue, RevocationLog
 )
 from validation import check_publish_approval, is_in_publish_window
 
@@ -501,12 +501,14 @@ def get_label_detail(label_id):
 
     history = RollbackHistory.query.filter_by(label_id=label_id).order_by(RollbackHistory.created_at.desc()).all()
     versions = PriceLabel.query.filter_by(sku=label.sku, store=label.store).order_by(PriceLabel.version).all()
+    revocation_logs = RevocationLog.query.filter_by(label_id=label_id).order_by(RevocationLog.created_at.desc()).all()
 
     return jsonify({
         'success': True,
         'data': {
             'label': label.to_dict(include_detail=True),
             'rollback_history': [h.to_dict() for h in history],
+            'revocation_logs': [r.to_dict() for r in revocation_logs],
             'versions': [{
                 'id': v.id,
                 'version': v.version,
@@ -852,6 +854,73 @@ def rollback_label(label_id):
         return jsonify({'success': True, 'message': '回滚成功'})
 
 
+@app.route('/api/labels/<int:label_id>/revoke', methods=['POST'])
+@require_roles('admin')
+def revoke_label(label_id):
+    data = request.get_json() or {}
+    reason = (data.get('reason') or '').strip()
+    if not reason:
+        return jsonify({'success': False, 'message': '撤销原因不能为空'}), 400
+
+    label = PriceLabel.query.get(label_id)
+    if not label:
+        return jsonify({'success': False, 'message': '价签不存在'}), 404
+
+    if label.status != 'published':
+        return jsonify({'success': False, 'message': '只有已发布状态才能撤销发布'}), 400
+
+    printed_items = PrintQueue.query.filter(
+        PrintQueue.label_id == label_id,
+        PrintQueue.status == 'printed'
+    ).all()
+    if printed_items:
+        return jsonify({
+            'success': False,
+            'message': '该价签已有已打印记录，不能直接撤销。请先记录线下处理原因，联系门店回收已打印价签后再操作。',
+            'code': 'PRINTED_EXISTS'
+        }), 400
+
+    user = g.current_user
+    now = datetime.utcnow()
+    original_status = label.status
+
+    pending_items = PrintQueue.query.filter(
+        PrintQueue.label_id == label_id,
+        PrintQueue.status == 'pending'
+    ).all()
+    affected_ids = []
+    for pq in pending_items:
+        affected_ids.append(pq.id)
+        db.session.delete(pq)
+
+    label.status = 'revoked'
+    label.revoked_at = now
+    label.revoked_by = user.id
+    label.revoke_reason = reason
+
+    rev_log = RevocationLog(
+        label_id=label.id,
+        sku=label.sku,
+        store=label.store,
+        original_status=original_status,
+        reason=reason,
+        operated_by=user.id,
+        affected_print_queue_ids=','.join(str(i) for i in affected_ids) if affected_ids else ''
+    )
+    db.session.add(rev_log)
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'message': '发布撤销成功',
+        'data': {
+            'label_id': label.id,
+            'revoked_at': now.isoformat(),
+            'affected_print_queue_count': len(affected_ids)
+        }
+    })
+
+
 # ==================== 打印清单接口 ====================
 @app.route('/api/print-queue', methods=['GET'])
 @require_login
@@ -921,6 +990,36 @@ def list_rollback_history():
     })
 
 
+# ==================== 撤销日志接口 ====================
+@app.route('/api/revocation-logs', methods=['GET'])
+@require_login
+def list_revocation_logs():
+    page = request.args.get('page', 1, type=int)
+    size = request.args.get('size', 20, type=int)
+    sku = request.args.get('sku', '')
+    store = request.args.get('store', '')
+
+    query = RevocationLog.query
+    if sku:
+        query = query.filter(RevocationLog.sku.like(f'%{sku}%'))
+    if store:
+        query = query.filter(RevocationLog.store.like(f'%{store}%'))
+
+    total = query.count()
+    records = query.order_by(RevocationLog.created_at.desc()).offset((page - 1) * size).limit(size).all()
+
+    result_list = []
+    for r in records:
+        d = r.to_dict()
+        d['operated_by_name'] = _get_username(r.operated_by)
+        result_list.append(d)
+
+    return jsonify({
+        'success': True,
+        'data': {'list': result_list, 'total': total}
+    })
+
+
 # ==================== 导出接口 ====================
 def _get_username(user_id):
     if not user_id:
@@ -950,7 +1049,8 @@ def export_labels():
         'draft': '草稿',
         'pending_approval': '待审',
         'published': '已发布',
-        'rolled_back': '已回滚'
+        'rolled_back': '已回滚',
+        'revoked': '已撤销'
     }
 
     rows = []
@@ -978,6 +1078,10 @@ def export_labels():
             '回滚人': _get_username(l.rolled_back_by),
             '回滚时间': l.rolled_back_at.strftime('%Y-%m-%d %H:%M:%S') if l.rolled_back_at else '',
             '回滚原因': l.rollback_reason or '',
+            '是否撤销': '是' if l.status == 'revoked' else '否',
+            '撤销人': _get_username(l.revoked_by),
+            '撤销时间': l.revoked_at.strftime('%Y-%m-%d %H:%M:%S') if l.revoked_at else '',
+            '撤销原因': l.revoke_reason or '',
             '上一版本ID': l.previous_version_id or '',
             '关联批次ID': l.batch_id or '',
         })
@@ -1052,7 +1156,8 @@ def export_rollback_history():
         'draft': '草稿',
         'pending_approval': '待审',
         'published': '已发布',
-        'rolled_back': '已回滚'
+        'rolled_back': '已回滚',
+        'revoked': '已撤销'
     }
 
     rows = []
@@ -1083,6 +1188,53 @@ def export_rollback_history():
     return resp
 
 
+@app.route('/api/export/revocation-logs', methods=['GET'])
+@require_login
+def export_revocation_logs():
+    sku = request.args.get('sku', '')
+    store = request.args.get('store', '')
+
+    query = RevocationLog.query
+    if sku:
+        query = query.filter(RevocationLog.sku.like(f'%{sku}%'))
+    if store:
+        query = query.filter(RevocationLog.store.like(f'%{store}%'))
+
+    records = query.order_by(RevocationLog.created_at.desc()).all()
+
+    status_map = {
+        'draft': '草稿',
+        'pending_approval': '待审',
+        'published': '已发布',
+        'rolled_back': '已回滚',
+        'revoked': '已撤销'
+    }
+
+    rows = []
+    for r in records:
+        rows.append({
+            '记录ID': r.id,
+            '价签ID': r.label_id,
+            'SKU': r.sku,
+            '门店': r.store,
+            '原状态': status_map.get(r.original_status, r.original_status or ''),
+            '撤销原因': r.reason or '',
+            '操作人': _get_username(r.operated_by),
+            '操作时间': r.created_at.strftime('%Y-%m-%d %H:%M:%S') if r.created_at else '',
+            '受影响打印清单ID': r.affected_print_queue_ids or '',
+        })
+
+    df = pd.DataFrame(rows)
+    output = StringIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
+    output.seek(0)
+
+    resp = make_response(output.getvalue())
+    resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename=revocation_logs_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
+    return resp
+
+
 # ==================== 统计接口 ====================
 @app.route('/api/stats/overview', methods=['GET'])
 @require_login
@@ -1092,8 +1244,10 @@ def stats_overview():
     pending = PriceLabel.query.filter_by(status='pending_approval').count()
     published = PriceLabel.query.filter_by(status='published').count()
     rolled_back = PriceLabel.query.filter_by(status='rolled_back').count()
+    revoked = PriceLabel.query.filter_by(status='revoked').count()
     pending_print = PrintQueue.query.filter_by(status='pending').count()
     rollback_count = RollbackHistory.query.count()
+    revocation_count = RevocationLog.query.count()
 
     return jsonify({
         'success': True,
@@ -1103,8 +1257,10 @@ def stats_overview():
             'pending_approval': pending,
             'published': published,
             'rolled_back': rolled_back,
+            'revoked': revoked,
             'pending_print': pending_print,
             'rollback_count': rollback_count,
+            'revocation_count': revocation_count,
             'in_publish_window': is_in_publish_window()[0]
         }
     })

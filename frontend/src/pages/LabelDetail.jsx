@@ -6,6 +6,7 @@ import {
 import {
   ArrowLeftOutlined, UndoOutlined, CheckCircleOutlined, EyeOutlined,
   ClockCircleOutlined, SendOutlined, PrinterOutlined, RollbackOutlined,
+  StopOutlined, ExclamationCircleOutlined,
 } from '@ant-design/icons'
 import { useNavigate, useParams } from 'react-router-dom'
 import dayjs from 'dayjs'
@@ -19,6 +20,7 @@ const STATUS_MAP = {
   pending_approval: { label: '待审', color: 'processing' },
   published: { label: '已发布', color: 'success' },
   rolled_back: { label: '已回滚', color: 'warning' },
+  revoked: { label: '已撤销', color: 'error' },
 }
 
 export default function LabelDetail({ user }) {
@@ -28,7 +30,9 @@ export default function LabelDetail({ user }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
   const [rollbackOpen, setRollbackOpen] = useState(false)
+  const [revokeOpen, setRevokeOpen] = useState(false)
   const [form] = Form.useForm()
+  const [revokeForm] = Form.useForm()
 
   const canRollback = user?.role === 'admin'
 
@@ -59,6 +63,26 @@ export default function LabelDetail({ user }) {
       loadDetail()
     } catch (err) {
       message.error(err.message)
+    }
+  }
+
+  const handleRevoke = async (values) => {
+    try {
+      await api.post(`/labels/${id}/revoke`, { reason: values.reason })
+      message.success('发布撤销成功')
+      setRevokeOpen(false)
+      revokeForm.resetFields()
+      loadDetail()
+    } catch (err) {
+      if (err.message && err.message.includes('已打印')) {
+        modal.warning({
+          title: '无法撤销',
+          content: err.message,
+          okText: '知道了',
+        })
+      } else {
+        message.error(err.message)
+      }
     }
   }
 
@@ -96,9 +120,18 @@ export default function LabelDetail({ user }) {
         </div>
         <Space>
           {label.status === 'published' && canRollback && (
-            <Button danger icon={<RollbackOutlined />} onClick={() => setRollbackOpen(true)}>
-              回滚此价签
-            </Button>
+            <>
+              <Button
+                danger
+                icon={<StopOutlined />}
+                onClick={() => setRevokeOpen(true)}
+              >
+                发布撤销
+              </Button>
+              <Button danger icon={<RollbackOutlined />} onClick={() => setRollbackOpen(true)}>
+                回滚此价签
+              </Button>
+            </>
           )}
         </Space>
       </div>
@@ -184,6 +217,18 @@ export default function LabelDetail({ user }) {
                     </div>
                   ),
                 },
+                label.revoked_at && {
+                  color: 'red',
+                  children: (
+                    <div>
+                      <div><Text strong>已撤销</Text></div>
+                      <div style={{ color: '#8c8c8c', fontSize: 12 }}>
+                        {dayjs(label.revoked_at).format('YYYY-MM-DD HH:mm:ss')}
+                        {label.revoke_reason && <div style={{ marginTop: 4, color: '#ff4d4f' }}>原因：{label.revoke_reason}</div>}
+                      </div>
+                    </div>
+                  ),
+                },
               ].filter(Boolean)}
             />
           </Card>
@@ -201,6 +246,26 @@ export default function LabelDetail({ user }) {
                   { title: '到版本', dataIndex: 'to_version', width: 90, align: 'center', render: v => <Tag color="blue">v{v}</Tag> },
                   { title: '原因', dataIndex: 'reason', render: v => v || '-' },
                   { title: '操作人ID', dataIndex: 'operated_by', width: 90, align: 'center' },
+                ]}
+              />
+            </Card>
+          )}
+
+          {data.revocation_logs?.length > 0 && (
+            <Card title="撤销日志" size="small" style={{ marginTop: 16 }}>
+              <Table
+                size="small"
+                rowKey="id"
+                pagination={false}
+                dataSource={data.revocation_logs}
+                columns={[
+                  { title: '撤销时间', dataIndex: 'created_at', width: 170, render: v => dayjs(v).format('YYYY-MM-DD HH:mm:ss') },
+                  { title: '原状态', dataIndex: 'original_status', width: 100, align: 'center', render: v => {
+                    const s = STATUS_MAP[v] || { label: v, color: 'default' }
+                    return <Tag color={s.color}>{s.label}</Tag>
+                  }},
+                  { title: '撤销原因', dataIndex: 'reason', render: v => v || '-' },
+                  { title: '受影响打印清单ID', dataIndex: 'affected_print_queue_ids', width: 160, render: v => v || '无' },
                 ]}
               />
             </Card>
@@ -271,6 +336,37 @@ export default function LabelDetail({ user }) {
             <Text type="danger" strong>
               <UndoOutlined /> 回滚操作将写入历史，不可撤销。若选择历史版本，将生成新版本 v{label.version + 1}。
             </Text>
+          </div>
+        </Form>
+      </Modal>
+
+      <Modal
+        title={`发布撤销价签 #${label.id}`}
+        open={revokeOpen}
+        onCancel={() => { setRevokeOpen(false); revokeForm.resetFields() }}
+        onOk={() => revokeForm.submit()}
+        okText="确认撤销"
+        okButtonProps={{ danger: true }}
+        destroyOnClose
+        width={560}
+      >
+        <Form form={revokeForm} layout="vertical" onFinish={handleRevoke}>
+          <Form.Item
+            name="reason"
+            label="撤销原因"
+            rules={[{ required: true, message: '请填写撤销原因' }]}
+          >
+            <TextArea rows={4} placeholder="请详细说明撤销发布的原因，将记入独立操作日志" maxLength={200} showCount />
+          </Form.Item>
+          <div style={{ padding: 12, background: '#fff2f0', borderRadius: 6, border: '1px solid #ffccc7' }}>
+            <Text type="danger" strong>
+              <ExclamationCircleOutlined /> 撤销后价签将从"已发布"变为"已撤销"，未打印的打印清单项将被同步移除。该操作不可逆。
+            </Text>
+            <div style={{ marginTop: 8 }}>
+              <Text type="warning">
+                如果该价签已有已打印记录，将无法直接撤销，需先记录线下处理原因并回收已打印价签。
+              </Text>
+            </div>
           </div>
         </Form>
       </Modal>

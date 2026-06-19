@@ -9,6 +9,7 @@ import {
   HistoryOutlined,
   ClockCircleOutlined,
   ArrowRightOutlined,
+  StopOutlined,
 } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import api from '../utils/api.js'
@@ -87,10 +88,16 @@ export default function Dashboard() {
               <StatCard title="已回滚" value={stats.rolled_back} color="#ff4d4f" icon={<UndoOutlined />} path="/labels?status=rolled_back" />
             </Col>
             <Col xs={24} sm={12} md={8} lg={6}>
+              <StatCard title="已撤销" value={stats.revoked} color="#cf1322" icon={<StopOutlined />} path="/labels?status=revoked" />
+            </Col>
+            <Col xs={24} sm={12} md={8} lg={6}>
               <StatCard title="待打印" value={stats.pending_print} color="#13c2c2" icon={<PrinterOutlined />} path="/print-queue" />
             </Col>
             <Col xs={24} sm={12} md={8} lg={6}>
               <StatCard title="回滚次数" value={stats.rollback_count} color="#eb2f96" icon={<HistoryOutlined />} path="/rollback-history" />
+            </Col>
+            <Col xs={24} sm={12} md={8} lg={6}>
+              <StatCard title="撤销次数" value={stats.revocation_count} color="#8c8c8c" icon={<StopOutlined />} path="/revocation-logs" />
             </Col>
             <Col xs={24} sm={12} md={8} lg={6}>
               <Card
@@ -178,6 +185,9 @@ export default function Dashboard() {
                   </Button>
                   <Button size="large" block icon={<HistoryOutlined />} onClick={() => navigate('/rollback-history')}>
                     查看回滚历史
+                  </Button>
+                  <Button size="large" block icon={<StopOutlined />} onClick={() => navigate('/revocation-logs')}>
+                    查看撤销日志
                   </Button>
                 </Space>
               </Card>

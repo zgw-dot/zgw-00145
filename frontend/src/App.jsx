@@ -11,6 +11,7 @@ import {
   SettingOutlined,
   UserOutlined,
   LogoutOutlined,
+  StopOutlined,
 } from '@ant-design/icons'
 import Login from './pages/Login.jsx'
 import Dashboard from './pages/Dashboard.jsx'
@@ -21,6 +22,7 @@ import LabelDetail from './pages/LabelDetail.jsx'
 import ApprovalPage from './pages/ApprovalPage.jsx'
 import PrintQueue from './pages/PrintQueue.jsx'
 import RollbackHistoryPage from './pages/RollbackHistoryPage.jsx'
+import RevocationLogPage from './pages/RevocationLogPage.jsx'
 import ConfigPage from './pages/ConfigPage.jsx'
 import api from './utils/api.js'
 
@@ -33,6 +35,7 @@ const menuItems = [
   { key: '/approval', icon: <AuditOutlined />, label: '价签审批' },
   { key: '/print-queue', icon: <PrinterOutlined />, label: '打印清单' },
   { key: '/rollback-history', icon: <HistoryOutlined />, label: '回滚历史' },
+  { key: '/revocation-logs', icon: <StopOutlined />, label: '撤销日志' },
   { key: '/config', icon: <SettingOutlined />, label: '系统配置', roles: ['admin'] },
 ]
 
@@ -132,6 +135,7 @@ function AppContent() {
               <Route path="/approval" element={<ApprovalPage user={user} />} />
               <Route path="/print-queue" element={<PrintQueue user={user} />} />
               <Route path="/rollback-history" element={<RollbackHistoryPage />} />
+              <Route path="/revocation-logs" element={<RevocationLogPage />} />
               <Route path="/config" element={<ConfigPage user={user} />} />
               <Route path="*" element={<Navigate to="/dashboard" replace />} />
             </Routes>

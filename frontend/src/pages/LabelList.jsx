@@ -5,13 +5,13 @@ import {
 } from 'antd'
 import {
   SearchOutlined, EyeOutlined, SendOutlined, DownloadOutlined,
-  CheckCircleOutlined, ReloadOutlined,
+  CheckCircleOutlined, ReloadOutlined, StopOutlined,
 } from '@ant-design/icons'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import dayjs from 'dayjs'
 import api from '../utils/api.js'
 
-const { Title, Paragraph } = Typography
+const { Title, Paragraph, Text } = Typography
 const { RangePicker } = DatePicker
 
 const STATUS_MAP = {
@@ -19,6 +19,7 @@ const STATUS_MAP = {
   pending_approval: { label: '待审', color: 'processing' },
   published: { label: '已发布', color: 'success' },
   rolled_back: { label: '已回滚', color: 'warning' },
+  revoked: { label: '已撤销', color: 'error' },
 }
 
 export default function LabelList({ user }) {
@@ -37,6 +38,10 @@ export default function LabelList({ user }) {
 
   const canSubmit = ['admin', 'operator'].includes(user?.role)
   const canExport = ['admin', 'operator', 'clerk'].includes(user?.role)
+  const canRevoke = user?.role === 'admin'
+  const [revokeModalOpen, setRevokeModalOpen] = useState(false)
+  const [revokeReason, setRevokeReason] = useState('')
+  const [revoking, setRevoking] = useState(false)
 
   useEffect(() => {
     loadData(1, 20)
@@ -95,6 +100,43 @@ export default function LabelList({ user }) {
     })
     window.open(`/api/export/labels?${params}`, '_blank')
     message.success('已开始导出')
+  }
+
+  const handleBatchRevoke = () => {
+    const publishedSelected = data.filter(d => selectedRowKeys.includes(d.id) && d.status === 'published')
+    if (publishedSelected.length === 0) {
+      message.warning('请选择至少一条已发布的价签')
+      return
+    }
+    setRevokeReason('')
+    setRevokeModalOpen(true)
+  }
+
+  const confirmRevoke = async () => {
+    if (!revokeReason.trim()) {
+      message.warning('请填写撤销原因')
+      return
+    }
+    setRevoking(true)
+    const publishedSelected = data.filter(d => selectedRowKeys.includes(d.id) && d.status === 'published')
+    let successCount = 0
+    let failCount = 0
+    for (const label of publishedSelected) {
+      try {
+        await api.post(`/labels/${label.id}/revoke`, { reason: revokeReason.trim() })
+        successCount++
+      } catch (err) {
+        failCount++
+        message.error(`价签 #${label.id} 撤销失败: ${err.message}`)
+      }
+    }
+    setRevoking(false)
+    setRevokeModalOpen(false)
+    if (successCount > 0) {
+      message.success(`成功撤销 ${successCount} 条价签`)
+    }
+    setSelectedRowKeys([])
+    loadData(pagination.current, pagination.pageSize)
   }
 
   const columns = [
@@ -194,6 +236,16 @@ export default function LabelList({ user }) {
               导出 CSV
             </Button>
           )}
+          {canRevoke && (
+            <Button
+              danger
+              icon={<StopOutlined />}
+              disabled={selectedRowKeys.length === 0}
+              onClick={handleBatchRevoke}
+            >
+              发布撤销 ({data.filter(d => selectedRowKeys.includes(d.id) && d.status === 'published').length})
+            </Button>
+          )}
           {canSubmit && (
             <Button type="primary" icon={<SendOutlined />} disabled={selectedRowKeys.length === 0} onClick={handleSubmit}>
               提交审批 ({selectedRowKeys.length})
@@ -255,10 +307,10 @@ export default function LabelList({ user }) {
           dataSource={data}
           loading={loading}
           scroll={{ x: 1400 }}
-          rowSelection={canSubmit ? {
+          rowSelection={canSubmit || canRevoke ? {
             selectedRowKeys,
             onChange: setSelectedRowKeys,
-            getCheckboxProps: (r) => ({ disabled: r.status !== 'draft' }),
+            getCheckboxProps: (r) => ({ disabled: r.status !== 'draft' && r.status !== 'published' }),
           } : undefined}
           pagination={{
             ...pagination,
@@ -269,6 +321,35 @@ export default function LabelList({ user }) {
           }}
         />
       </Card>
+
+      <Modal
+        title="发布撤销"
+        open={revokeModalOpen}
+        onCancel={() => setRevokeModalOpen(false)}
+        onOk={confirmRevoke}
+        okText="确认撤销"
+        okButtonProps={{ danger: true }}
+        confirmLoading={revoking}
+        destroyOnClose
+        width={480}
+      >
+        <div style={{ marginBottom: 16 }}>
+          <Text>即将对 <Text strong>{data.filter(d => selectedRowKeys.includes(d.id) && d.status === 'published').length}</Text> 条已发布价签执行发布撤销。</Text>
+        </div>
+        <Input.TextArea
+          rows={4}
+          value={revokeReason}
+          onChange={(e) => setRevokeReason(e.target.value)}
+          placeholder="请填写撤销原因（必填）"
+          maxLength={200}
+          showCount
+        />
+        <div style={{ padding: 12, background: '#fff2f0', borderRadius: 6, border: '1px solid #ffccc7', marginTop: 12 }}>
+          <Text type="danger" strong>
+            撤销后价签将从"已发布"变为"已撤销"，未打印的打印清单项将被同步移除。如已有已打印记录，将无法撤销。
+          </Text>
+        </div>
+      </Modal>
     </div>
   )
 }
