@@ -121,3 +121,11 @@ html, body, #root {
   gap: 8px;
   flex-wrap: wrap;
 }
+
+.conflict-row {
+  background: #fff2f0 !important;
+}
+
+.conflict-row:hover > td {
+  background: #ffccc7 !important;
+}

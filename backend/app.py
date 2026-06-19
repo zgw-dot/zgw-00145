@@ -12,7 +12,8 @@ from dateutil import parser as date_parser
 from models import (
     db, User, SystemConfig, ImportBatch, ImportValidation,
     PriceLabel, RollbackHistory, PrintQueue, RevocationLog,
-    RevocationRequest, RevocationRequestLog
+    RevocationRequest, RevocationRequestLog,
+    HandoverSheet, HandoverItem, HandoverLog
 )
 from validation import check_publish_approval, is_in_publish_window
 
@@ -837,6 +838,7 @@ def rollback_label(label_id):
         )
         db.session.add(pq)
 
+        _mark_handover_conflict_on_label_change(label.id, '已被回滚', user.id)
         db.session.commit()
 
         return jsonify({
@@ -865,6 +867,7 @@ def rollback_label(label_id):
             operated_by=user.id
         )
         db.session.add(rh)
+        _mark_handover_conflict_on_label_change(label.id, '已被回滚', user.id)
         db.session.commit()
 
         return jsonify({'success': True, 'message': '回滚成功'})
@@ -924,6 +927,7 @@ def revoke_label(label_id):
         affected_print_queue_ids=','.join(str(i) for i in affected_ids) if affected_ids else ''
     )
     db.session.add(rev_log)
+    _mark_handover_conflict_on_label_change(label.id, '已被撤销发布', user.id)
     db.session.commit()
 
     return jsonify({
@@ -1171,6 +1175,7 @@ def review_revocation_request(request_id):
             affected_print_queue_ids=','.join(str(i) for i in affected_ids) if affected_ids else ''
         )
         db.session.add(action_log)
+        _mark_handover_conflict_on_label_change(label.id, '已被撤销发布(审批通过)', user.id)
 
     else:
         if not comment:
@@ -1689,6 +1694,551 @@ def export_revocation_request_logs():
     return resp
 
 
+# ==================== 交接单接口 ====================
+HANDOVER_STATUS_MAP = {
+    'pending': '待签收',
+    'signed': '已签收',
+    'voided': '已作废',
+}
+
+
+def _recalc_handover_conflict(sheet_id):
+    sheet = HandoverSheet.query.get(sheet_id)
+    if not sheet:
+        return
+    has_any_conflict = False
+    for item in sheet.items:
+        label = PriceLabel.query.get(item.label_id)
+        if not label or label.status in ('revoked', 'rolled_back'):
+            item.is_conflict = True
+            reasons = []
+            if not label:
+                item.conflict_reason = '价签已被删除'
+            else:
+                if label.status == 'revoked':
+                    reasons.append('价签已被撤销')
+                if label.status == 'rolled_back':
+                    reasons.append('价签已被回滚')
+                if label.version != item.snapshot_label_version:
+                    reasons.append(f'价签版本已变更(v{item.snapshot_label_version}→v{label.version})')
+                item.conflict_reason = '；'.join(reasons) if reasons else None
+            has_any_conflict = True
+        elif label.version != item.snapshot_label_version:
+            item.is_conflict = True
+            item.conflict_reason = f'价签版本已变更(v{item.snapshot_label_version}→v{label.version})'
+            has_any_conflict = True
+        else:
+            item.is_conflict = False
+            item.conflict_reason = None
+    sheet.has_conflict = has_any_conflict
+    sheet.conflict_checked_at = datetime.utcnow()
+
+
+def _mark_handover_conflict_on_label_change(label_id, change_description, operated_by_user_id):
+    affected_items = HandoverItem.query.filter_by(label_id=label_id).join(HandoverSheet).filter(
+        HandoverSheet.status.in_(['pending', 'signed'])
+    ).all()
+    if not affected_items:
+        return
+    now = datetime.utcnow()
+    for item in affected_items:
+        item.is_conflict = True
+        existing_reason = item.conflict_reason or ''
+        new_reason = change_description
+        item.conflict_reason = f'{existing_reason}；{new_reason}' if existing_reason else new_reason
+        item.sheet.has_conflict = True
+        item.sheet.conflict_checked_at = now
+
+        log = HandoverLog(
+            sheet_id=item.sheet_id,
+            sheet_no=item.sheet.sheet_no,
+            action='conflict_auto_mark',
+            detail=f'价签{change_description}，自动标记冲突(价签ID:{label_id})',
+            operated_by=operated_by_user_id,
+            created_at=now,
+        )
+        db.session.add(log)
+
+
+@app.route('/api/handover-sheets', methods=['GET'])
+@require_login
+def list_handover_sheets():
+    page = request.args.get('page', 1, type=int)
+    size = request.args.get('size', 20, type=int)
+    status = request.args.get('status', '')
+    store = request.args.get('store', '')
+    sheet_no = request.args.get('sheet_no', '')
+    has_conflict = request.args.get('has_conflict', '')
+
+    query = HandoverSheet.query
+    if status:
+        query = query.filter_by(status=status)
+    if store:
+        query = query.filter(HandoverSheet.store.like(f'%{store}%'))
+    if sheet_no:
+        query = query.filter(HandoverSheet.sheet_no.like(f'%{sheet_no}%'))
+    if has_conflict and has_conflict.lower() == 'true':
+        query = query.filter_by(has_conflict=True)
+
+    total = query.count()
+    records = query.order_by(HandoverSheet.created_at.desc()).offset((page - 1) * size).limit(size).all()
+
+    result_list = []
+    for r in records:
+        d = r.to_dict()
+        d['created_by_name'] = _get_username(r.created_by)
+        d['signed_by_name'] = _get_username(r.signed_by)
+        d['voided_by_name'] = _get_username(r.voided_by)
+        result_list.append(d)
+
+    return jsonify({
+        'success': True,
+        'data': {'list': result_list, 'total': total}
+    })
+
+
+@app.route('/api/handover-sheets/<int:sheet_id>', methods=['GET'])
+@require_login
+def get_handover_sheet_detail(sheet_id):
+    sheet = HandoverSheet.query.get(sheet_id)
+    if not sheet:
+        return jsonify({'success': False, 'message': '交接单不存在'}), 404
+
+    _recalc_handover_conflict(sheet_id)
+    db.session.commit()
+
+    d = sheet.to_dict(include_items=True)
+    d['created_by_name'] = _get_username(sheet.created_by)
+    d['signed_by_name'] = _get_username(sheet.signed_by)
+    d['voided_by_name'] = _get_username(sheet.voided_by)
+
+    logs = HandoverLog.query.filter_by(sheet_id=sheet_id).order_by(HandoverLog.created_at.desc()).all()
+    d['logs'] = [log.to_dict() for log in logs]
+    for log_entry in d['logs']:
+        log_entry['operated_by_name'] = _get_username(log_entry['operated_by'])
+
+    return jsonify({'success': True, 'data': d})
+
+
+@app.route('/api/handover-sheets', methods=['POST'])
+@require_roles('admin', 'operator')
+def create_handover_sheet():
+    data = request.get_json() or {}
+    title = (data.get('title') or '').strip()
+    store = (data.get('store') or '').strip()
+    remark = (data.get('remark') or '').strip()
+    label_ids = data.get('label_ids', [])
+
+    if not title:
+        return jsonify({'success': False, 'message': '交接单标题不能为空'}), 400
+    if not store:
+        return jsonify({'success': False, 'message': '门店不能为空'}), 400
+    if not label_ids:
+        return jsonify({'success': False, 'message': '请选择至少一个价签'}), 400
+
+    user = g.current_user
+    now = datetime.utcnow()
+
+    valid_labels = []
+    failed = []
+    seen_ids = set()
+
+    for lid in label_ids:
+        if lid in seen_ids:
+            failed.append({'id': lid, 'reason': '重复添加同一价签'})
+            continue
+        seen_ids.add(lid)
+
+        label = PriceLabel.query.get(lid)
+        if not label:
+            failed.append({'id': lid, 'reason': '价签不存在'})
+            continue
+        if label.status not in ('published',):
+            failed.append({'id': lid, 'reason': f'价签状态为{label.status}，只有已发布价签可加入交接单'})
+            continue
+        if label.store != store:
+            failed.append({'id': lid, 'reason': f'价签门店"{label.store}"与交接单门店"{store}"不一致'})
+            continue
+
+        existing = HandoverItem.query.filter_by(label_id=lid).join(HandoverSheet).filter(
+            HandoverSheet.status.in_(['pending', 'signed'])
+        ).first()
+        if existing:
+            failed.append({'id': lid, 'reason': f'该价签已在交接单 {existing.sheet.sheet_no} 中，不可重复加入'})
+            continue
+
+        valid_labels.append(label)
+
+    if not valid_labels:
+        return jsonify({'success': False, 'message': '没有可添加的有效价签', 'data': {'failed': failed}}), 400
+
+    sheet_no = f'HO{now.strftime("%Y%m%d%H%M%S")}{uuid.uuid4().hex[:6].upper()}'
+    sheet = HandoverSheet(
+        sheet_no=sheet_no,
+        title=title,
+        store=store,
+        status='pending',
+        total_items=len(valid_labels),
+        remark=remark or None,
+        created_by=user.id,
+        created_at=now,
+    )
+    db.session.add(sheet)
+    db.session.flush()
+
+    items = []
+    for label in valid_labels:
+        item = HandoverItem(
+            sheet_id=sheet.id,
+            label_id=label.id,
+            snapshot_sku=label.sku,
+            snapshot_store=label.store,
+            snapshot_original_price=label.original_price,
+            snapshot_promotion_price=label.promotion_price,
+            snapshot_effective_from=label.effective_from,
+            snapshot_effective_to=label.effective_to,
+            snapshot_template=label.template,
+            snapshot_label_status=label.status,
+            snapshot_label_version=label.version,
+            print_status='pending',
+        )
+        db.session.add(item)
+        items.append(item)
+
+    log = HandoverLog(
+        sheet_id=sheet.id,
+        sheet_no=sheet_no,
+        action='create',
+        detail=f'创建交接单，含{len(valid_labels)}项价签' + (f'，{len(failed)}项被拒绝' if failed else ''),
+        operated_by=user.id,
+        created_at=now,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'data': {
+            'sheet_id': sheet.id,
+            'sheet_no': sheet_no,
+            'total_items': len(valid_labels),
+            'failed': failed,
+        }
+    })
+
+
+@app.route('/api/handover-sheets/<int:sheet_id>/sign', methods=['POST'])
+@require_roles('admin', 'operator', 'clerk')
+def sign_handover_sheet(sheet_id):
+    data = request.get_json() or {}
+    sheet = HandoverSheet.query.get(sheet_id)
+    if not sheet:
+        return jsonify({'success': False, 'message': '交接单不存在'}), 404
+
+    if sheet.status != 'pending':
+        return jsonify({'success': False, 'message': f'交接单状态为{HANDOVER_STATUS_MAP.get(sheet.status, sheet.status)}，无法签收'}), 400
+
+    user = g.current_user
+    now = datetime.utcnow()
+
+    conflict_items = HandoverItem.query.filter_by(sheet_id=sheet_id, is_conflict=True).count()
+    if conflict_items > 0:
+        return jsonify({
+            'success': False,
+            'message': f'交接单中有{conflict_items}项冲突项，请先处理冲突后再签收',
+            'code': 'CONFLICT_EXISTS',
+        }), 400
+
+    sheet.status = 'signed'
+    sheet.signed_by = user.id
+    sheet.signed_at = now
+
+    for item in sheet.items:
+        item.print_status = 'printed'
+
+    log = HandoverLog(
+        sheet_id=sheet.id,
+        sheet_no=sheet.sheet_no,
+        action='sign',
+        detail=f'签收交接单，签收人: {user.username}',
+        operated_by=user.id,
+        created_at=now,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return jsonify({'success': True, 'message': '签收成功', 'data': {'sheet_id': sheet.id, 'signed_at': now.isoformat()}})
+
+
+@app.route('/api/handover-sheets/<int:sheet_id>/void', methods=['POST'])
+@require_roles('admin')
+def void_handover_sheet(sheet_id):
+    data = request.get_json() or {}
+    void_reason = (data.get('reason') or '').strip()
+    if not void_reason:
+        return jsonify({'success': False, 'message': '作废原因不能为空'}), 400
+
+    sheet = HandoverSheet.query.get(sheet_id)
+    if not sheet:
+        return jsonify({'success': False, 'message': '交接单不存在'}), 404
+
+    if sheet.status == 'voided':
+        return jsonify({'success': False, 'message': '交接单已作废，不能重复操作'}), 400
+
+    user = g.current_user
+    now = datetime.utcnow()
+    original_status = sheet.status
+
+    sheet.status = 'voided'
+    sheet.voided_by = user.id
+    sheet.voided_at = now
+    sheet.void_reason = void_reason
+
+    log = HandoverLog(
+        sheet_id=sheet.id,
+        sheet_no=sheet.sheet_no,
+        action='void',
+        detail=f'作废交接单(原状态: {HANDOVER_STATUS_MAP.get(original_status, original_status)})，原因: {void_reason}',
+        operated_by=user.id,
+        created_at=now,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return jsonify({'success': True, 'message': '作废成功', 'data': {'sheet_id': sheet.id}})
+
+
+@app.route('/api/handover-sheets/<int:sheet_id>/check-conflicts', methods=['POST'])
+@require_login
+def check_handover_conflicts(sheet_id):
+    sheet = HandoverSheet.query.get(sheet_id)
+    if not sheet:
+        return jsonify({'success': False, 'message': '交接单不存在'}), 404
+
+    _recalc_handover_conflict(sheet_id)
+    db.session.commit()
+
+    conflict_items = [item.to_dict() for item in sheet.items if item.is_conflict]
+
+    user = g.current_user
+    log = HandoverLog(
+        sheet_id=sheet.id,
+        sheet_no=sheet.sheet_no,
+        action='check_conflict',
+        detail=f'检查冲突，发现{len(conflict_items)}项冲突',
+        operated_by=user.id,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'data': {
+            'sheet_id': sheet.id,
+            'has_conflict': sheet.has_conflict,
+            'conflict_count': len(conflict_items),
+            'conflict_items': conflict_items,
+        }
+    })
+
+
+@app.route('/api/handover-sheets/available-labels', methods=['GET'])
+@require_roles('admin', 'operator')
+def get_available_labels_for_handover():
+    store = request.args.get('store', '')
+    query = PriceLabel.query.filter_by(status='published')
+    if store:
+        query = query.filter_by(store=store)
+
+    labels = query.order_by(PriceLabel.store, PriceLabel.sku).all()
+
+    result_list = []
+    for label in labels:
+        in_active_sheet = HandoverItem.query.filter_by(label_id=label.id).join(HandoverSheet).filter(
+            HandoverSheet.status.in_(['pending', 'signed'])
+        ).first()
+
+        result_list.append({
+            'id': label.id,
+            'sku': label.sku,
+            'store': label.store,
+            'original_price': label.original_price,
+            'promotion_price': label.promotion_price,
+            'effective_from': label.effective_from.isoformat(),
+            'effective_to': label.effective_to.isoformat(),
+            'template': label.template,
+            'version': label.version,
+            'in_active_sheet': in_active_sheet is not None,
+            'active_sheet_no': in_active_sheet.sheet.sheet_no if in_active_sheet else None,
+        })
+
+    return jsonify({'success': True, 'data': result_list})
+
+
+@app.route('/api/handover-logs', methods=['GET'])
+@require_login
+def list_handover_logs():
+    page = request.args.get('page', 1, type=int)
+    size = request.args.get('size', 20, type=int)
+    sheet_no = request.args.get('sheet_no', '')
+    action = request.args.get('action', '')
+    operated_by = request.args.get('operated_by', '', type=int)
+
+    query = HandoverLog.query
+    if sheet_no:
+        query = query.filter(HandoverLog.sheet_no.like(f'%{sheet_no}%'))
+    if action:
+        query = query.filter_by(action=action)
+    if operated_by:
+        query = query.filter_by(operated_by=operated_by)
+
+    total = query.count()
+    records = query.order_by(HandoverLog.created_at.desc()).offset((page - 1) * size).limit(size).all()
+
+    result_list = []
+    for r in records:
+        d = r.to_dict()
+        d['operated_by_name'] = _get_username(r.operated_by)
+        result_list.append(d)
+
+    return jsonify({
+        'success': True,
+        'data': {'list': result_list, 'total': total}
+    })
+
+
+@app.route('/api/export/handover-sheets', methods=['GET'])
+@require_login
+def export_handover_sheets():
+    status = request.args.get('status', '')
+    store = request.args.get('store', '')
+
+    query = HandoverSheet.query
+    if status:
+        query = query.filter_by(status=status)
+    if store:
+        query = query.filter(HandoverSheet.store.like(f'%{store}%'))
+
+    records = query.order_by(HandoverSheet.created_at.desc()).all()
+
+    rows = []
+    for r in records:
+        rows.append({
+            'ID': r.id,
+            '交接单号': r.sheet_no,
+            '标题': r.title,
+            '门店': r.store,
+            '状态': HANDOVER_STATUS_MAP.get(r.status, r.status),
+            '价签数量': r.total_items,
+            '有冲突': '是' if r.has_conflict else '否',
+            '备注': r.remark or '',
+            '创建人': _get_username(r.created_by),
+            '创建时间': r.created_at.strftime('%Y-%m-%d %H:%M:%S') if r.created_at else '',
+            '签收人': _get_username(r.signed_by),
+            '签收时间': r.signed_at.strftime('%Y-%m-%d %H:%M:%S') if r.signed_at else '',
+            '作废人': _get_username(r.voided_by),
+            '作废时间': r.voided_at.strftime('%Y-%m-%d %H:%M:%S') if r.voided_at else '',
+            '作废原因': r.void_reason or '',
+        })
+
+    columns = ['ID', '交接单号', '标题', '门店', '状态', '价签数量', '有冲突', '备注', '创建人', '创建时间', '签收人', '签收时间', '作废人', '作废时间', '作废原因']
+    df = pd.DataFrame(rows, columns=columns)
+    output = StringIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
+    output.seek(0)
+
+    resp = make_response(output.getvalue())
+    resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename=handover_sheets_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
+    return resp
+
+
+@app.route('/api/export/handover-sheet/<int:sheet_id>', methods=['GET'])
+@require_login
+def export_handover_sheet_detail(sheet_id):
+    sheet = HandoverSheet.query.get(sheet_id)
+    if not sheet:
+        return jsonify({'success': False, 'message': '交接单不存在'}), 404
+
+    rows = []
+    for idx, item in enumerate(sheet.items, 1):
+        rows.append({
+            '序号': idx,
+            '价签ID': item.label_id,
+            'SKU': item.snapshot_sku,
+            '门店': item.snapshot_store,
+            '原价': item.snapshot_original_price,
+            '促销价': item.snapshot_promotion_price,
+            '折扣率': f'{(item.snapshot_promotion_price / item.snapshot_original_price * 100):.1f}%' if item.snapshot_original_price > 0 else '-',
+            '生效开始时间': item.snapshot_effective_from.strftime('%Y-%m-%d %H:%M:%S') if item.snapshot_effective_from else '',
+            '生效结束时间': item.snapshot_effective_to.strftime('%Y-%m-%d %H:%M:%S') if item.snapshot_effective_to else '',
+            '模板': item.snapshot_template,
+            '快照状态': item.snapshot_label_status,
+            '快照版本': f'v{item.snapshot_label_version}',
+            '打印状态': '已打印' if item.print_status == 'printed' else '待打印',
+            '冲突': '是' if item.is_conflict else '否',
+            '冲突原因': item.conflict_reason or '',
+            '当前价签状态': item.label.status if item.label else '已删除',
+        })
+
+    columns = ['序号', '价签ID', 'SKU', '门店', '原价', '促销价', '折扣率', '生效开始时间', '生效结束时间', '模板', '快照状态', '快照版本', '打印状态', '冲突', '冲突原因', '当前价签状态']
+    df = pd.DataFrame(rows, columns=columns)
+    output = StringIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
+    output.seek(0)
+
+    resp = make_response(output.getvalue())
+    resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename=handover_{sheet.sheet_no}_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
+    return resp
+
+
+@app.route('/api/export/handover-logs', methods=['GET'])
+@require_login
+def export_handover_logs():
+    sheet_no = request.args.get('sheet_no', '')
+    action = request.args.get('action', '')
+
+    query = HandoverLog.query
+    if sheet_no:
+        query = query.filter(HandoverLog.sheet_no.like(f'%{sheet_no}%'))
+    if action:
+        query = query.filter_by(action=action)
+
+    records = query.order_by(HandoverLog.created_at.desc()).all()
+
+    action_cn = {
+        'create': '创建',
+        'sign': '签收',
+        'void': '作废',
+        'check_conflict': '冲突检查',
+        'conflict_auto_mark': '冲突自动标记',
+    }
+
+    rows = []
+    for r in records:
+        rows.append({
+            '记录ID': r.id,
+            '交接单ID': r.sheet_id,
+            '交接单号': r.sheet_no,
+            '操作类型': action_cn.get(r.action, r.action),
+            '操作详情': r.detail or '',
+            '操作人': _get_username(r.operated_by),
+            '操作时间': r.created_at.strftime('%Y-%m-%d %H:%M:%S') if r.created_at else '',
+        })
+
+    columns = ['记录ID', '交接单ID', '交接单号', '操作类型', '操作详情', '操作人', '操作时间']
+    df = pd.DataFrame(rows, columns=columns)
+    output = StringIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
+    output.seek(0)
+
+    resp = make_response(output.getvalue())
+    resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename=handover_logs_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
+    return resp
+
+
 # ==================== 统计接口 ====================
 @app.route('/api/stats/overview', methods=['GET'])
 @require_login
@@ -1705,6 +2255,10 @@ def stats_overview():
     revocation_count = RevocationLog.query.count()
     revocation_request_count = RevocationRequest.query.count()
     revocation_request_pending = RevocationRequest.query.filter_by(status='pending').count()
+    handover_pending = HandoverSheet.query.filter_by(status='pending').count()
+    handover_signed = HandoverSheet.query.filter_by(status='signed').count()
+    handover_voided = HandoverSheet.query.filter_by(status='voided').count()
+    handover_conflict = HandoverSheet.query.filter_by(has_conflict=True).count()
 
     return jsonify({
         'success': True,
@@ -1721,6 +2275,10 @@ def stats_overview():
             'revocation_count': revocation_count,
             'revocation_request_count': revocation_request_count,
             'revocation_request_pending': revocation_request_pending,
+            'handover_pending': handover_pending,
+            'handover_signed': handover_signed,
+            'handover_voided': handover_voided,
+            'handover_conflict': handover_conflict,
             'in_publish_window': is_in_publish_window()[0]
         }
     })

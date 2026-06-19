@@ -295,3 +295,129 @@ class RevocationRequestLog(db.Model):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'affected_print_queue_ids': self.affected_print_queue_ids,
         }
+
+
+class HandoverSheet(db.Model):
+    __tablename__ = 'handover_sheets'
+    id = db.Column(db.Integer, primary_key=True)
+    sheet_no = db.Column(db.String(50), unique=True, nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    store = db.Column(db.String(100), nullable=False)
+    status = db.Column(db.String(20), default='pending')
+    total_items = db.Column(db.Integer, default=0)
+    remark = db.Column(db.Text)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    signed_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    signed_at = db.Column(db.DateTime)
+    voided_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    voided_at = db.Column(db.DateTime)
+    void_reason = db.Column(db.Text)
+    has_conflict = db.Column(db.Boolean, default=False)
+    conflict_checked_at = db.Column(db.DateTime)
+
+    items = db.relationship('HandoverItem', backref='sheet', cascade='all, delete-orphan')
+
+    __table_args__ = (
+        db.Index('idx_handover_store', 'store'),
+        db.Index('idx_handover_status', 'status'),
+    )
+
+    def to_dict(self, include_items=False):
+        result = {
+            'id': self.id,
+            'sheet_no': self.sheet_no,
+            'title': self.title,
+            'store': self.store,
+            'status': self.status,
+            'total_items': self.total_items,
+            'remark': self.remark,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'signed_by': self.signed_by,
+            'signed_at': self.signed_at.isoformat() if self.signed_at else None,
+            'voided_by': self.voided_by,
+            'voided_at': self.voided_at.isoformat() if self.voided_at else None,
+            'void_reason': self.void_reason,
+            'has_conflict': self.has_conflict,
+            'conflict_checked_at': self.conflict_checked_at.isoformat() if self.conflict_checked_at else None,
+        }
+        if include_items:
+            result['items'] = [item.to_dict() for item in self.items]
+        return result
+
+
+class HandoverItem(db.Model):
+    __tablename__ = 'handover_items'
+    id = db.Column(db.Integer, primary_key=True)
+    sheet_id = db.Column(db.Integer, db.ForeignKey('handover_sheets.id'), nullable=False)
+    label_id = db.Column(db.Integer, db.ForeignKey('price_labels.id'), nullable=False)
+    snapshot_sku = db.Column(db.String(100), nullable=False)
+    snapshot_store = db.Column(db.String(100), nullable=False)
+    snapshot_original_price = db.Column(db.Float, nullable=False)
+    snapshot_promotion_price = db.Column(db.Float, nullable=False)
+    snapshot_effective_from = db.Column(db.DateTime, nullable=False)
+    snapshot_effective_to = db.Column(db.DateTime, nullable=False)
+    snapshot_template = db.Column(db.String(100), nullable=False)
+    snapshot_label_status = db.Column(db.String(20), nullable=False)
+    snapshot_label_version = db.Column(db.Integer, nullable=False)
+    print_status = db.Column(db.String(20), default='pending')
+    is_conflict = db.Column(db.Boolean, default=False)
+    conflict_reason = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    label = db.relationship('PriceLabel', foreign_keys=[label_id])
+
+    __table_args__ = (
+        db.Index('idx_handover_item_sheet', 'sheet_id'),
+        db.UniqueConstraint('sheet_id', 'label_id', name='uq_sheet_label'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'sheet_id': self.sheet_id,
+            'label_id': self.label_id,
+            'snapshot_sku': self.snapshot_sku,
+            'snapshot_store': self.snapshot_store,
+            'snapshot_original_price': self.snapshot_original_price,
+            'snapshot_promotion_price': self.snapshot_promotion_price,
+            'snapshot_effective_from': self.snapshot_effective_from.isoformat() if self.snapshot_effective_from else None,
+            'snapshot_effective_to': self.snapshot_effective_to.isoformat() if self.snapshot_effective_to else None,
+            'snapshot_template': self.snapshot_template,
+            'snapshot_label_status': self.snapshot_label_status,
+            'snapshot_label_version': self.snapshot_label_version,
+            'print_status': self.print_status,
+            'is_conflict': self.is_conflict,
+            'conflict_reason': self.conflict_reason,
+            'current_label_status': self.label.status if self.label else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class HandoverLog(db.Model):
+    __tablename__ = 'handover_logs'
+    id = db.Column(db.Integer, primary_key=True)
+    sheet_id = db.Column(db.Integer, db.ForeignKey('handover_sheets.id'), nullable=False)
+    sheet_no = db.Column(db.String(50), nullable=False)
+    action = db.Column(db.String(30), nullable=False)
+    detail = db.Column(db.Text)
+    operated_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    sheet = db.relationship('HandoverSheet', foreign_keys=[sheet_id])
+
+    __table_args__ = (
+        db.Index('idx_handover_log_sheet', 'sheet_id'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'sheet_id': self.sheet_id,
+            'sheet_no': self.sheet_no,
+            'action': self.action,
+            'detail': self.detail,
+            'operated_by': self.operated_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }

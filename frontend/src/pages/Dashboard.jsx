@@ -10,6 +10,8 @@ import {
   ClockCircleOutlined,
   ArrowRightOutlined,
   StopOutlined,
+  SwapOutlined,
+  WarningOutlined,
 } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import api from '../utils/api.js'
@@ -109,6 +111,15 @@ export default function Dashboard() {
               />
             </Col>
             <Col xs={24} sm={12} md={8} lg={6}>
+              <StatCard title="待签收交接单" value={stats.handover_pending} color="#1677ff" icon={<SwapOutlined />} path="/handover-sheets?status=pending" />
+            </Col>
+            <Col xs={24} sm={12} md={8} lg={6}>
+              <StatCard title="已签收交接单" value={stats.handover_signed} color="#52c41a" icon={<CheckCircleOutlined />} path="/handover-sheets?status=signed" />
+            </Col>
+            <Col xs={24} sm={12} md={8} lg={6}>
+              <StatCard title="交接单冲突" value={stats.handover_conflict} color="#ff4d4f" icon={<WarningOutlined />} path="/handover-sheets?has_conflict=true" />
+            </Col>
+            <Col xs={24} sm={12} md={8} lg={6}>
               <Card
                 className="stat-card"
                 styles={{ body: { padding: '24px 16px' } }}
@@ -197,6 +208,9 @@ export default function Dashboard() {
                   </Button>
                   <Button size="large" block icon={<StopOutlined />} onClick={() => navigate('/revocation-logs')}>
                     查看撤销日志
+                  </Button>
+                  <Button size="large" block icon={<SwapOutlined />} onClick={() => navigate('/handover-sheets')}>
+                    交接单管理
                   </Button>
                 </Space>
               </Card>

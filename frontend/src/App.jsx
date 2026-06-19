@@ -12,6 +12,7 @@ import {
   UserOutlined,
   LogoutOutlined,
   StopOutlined,
+  SwapOutlined,
 } from '@ant-design/icons'
 import Login from './pages/Login.jsx'
 import Dashboard from './pages/Dashboard.jsx'
@@ -25,6 +26,9 @@ import RollbackHistoryPage from './pages/RollbackHistoryPage.jsx'
 import RevocationLogPage from './pages/RevocationLogPage.jsx'
 import RevocationApprovalPage from './pages/RevocationApprovalPage.jsx'
 import ConfigPage from './pages/ConfigPage.jsx'
+import HandoverSheetList from './pages/HandoverSheetList.jsx'
+import HandoverSheetDetail from './pages/HandoverSheetDetail.jsx'
+import HandoverLogPage from './pages/HandoverLogPage.jsx'
 import api from './utils/api.js'
 
 const { Header, Sider, Content } = Layout
@@ -36,6 +40,8 @@ const menuItems = [
   { key: '/approval', icon: <AuditOutlined />, label: '价签审批' },
   { key: '/revocation-approval', icon: <StopOutlined />, label: '撤销审批', roles: ['admin'] },
   { key: '/print-queue', icon: <PrinterOutlined />, label: '打印清单' },
+  { key: '/handover-sheets', icon: <SwapOutlined />, label: '交接单管理' },
+  { key: '/handover-logs', icon: <SwapOutlined />, label: '交接单日志' },
   { key: '/rollback-history', icon: <HistoryOutlined />, label: '回滚历史' },
   { key: '/revocation-logs', icon: <StopOutlined />, label: '撤销日志' },
   { key: '/config', icon: <SettingOutlined />, label: '系统配置', roles: ['admin'] },
@@ -139,6 +145,9 @@ function AppContent() {
               <Route path="/print-queue" element={<PrintQueue user={user} />} />
               <Route path="/rollback-history" element={<RollbackHistoryPage />} />
               <Route path="/revocation-logs" element={<RevocationLogPage />} />
+              <Route path="/handover-sheets" element={<HandoverSheetList user={user} />} />
+              <Route path="/handover-sheets/:id" element={<HandoverSheetDetail user={user} />} />
+              <Route path="/handover-logs" element={<HandoverLogPage />} />
               <Route path="/config" element={<ConfigPage user={user} />} />
               <Route path="*" element={<Navigate to="/dashboard" replace />} />
             </Routes>
