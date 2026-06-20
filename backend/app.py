@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import hashlib
 from datetime import datetime, timedelta
 from io import StringIO
 
@@ -14,6 +15,7 @@ from models import (
     PriceLabel, RollbackHistory, PrintQueue, RevocationLog,
     RevocationRequest, RevocationRequestLog,
     HandoverSheet, HandoverItem, HandoverLog,
+    HandoverAuthorization, HandoverReceipt, HandoverAuditLog,
     DrillDemoData, DrillSession, DrillStep, DrillAcceptanceRecord
 )
 from validation import check_publish_approval, is_in_publish_window
@@ -58,10 +60,10 @@ def init_default_data():
                 {'key': 'effective_to', 'label': '生效结束时间', 'required': True}
             ]),
             'publish_window': json.dumps({
-                'enabled': True,
+                'enabled': False,
                 'start_hour': 9,
                 'end_hour': 18,
-                'weekdays_only': True
+                'weekdays_only': False
             })
         }
         for key, value in default_configs.items():
@@ -1356,6 +1358,198 @@ def _get_username(user_id):
     return u.username if u else ''
 
 
+def _get_client_ip():
+    try:
+        if request.headers.get('X-Forwarded-For'):
+            return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+        return request.remote_addr or 'unknown'
+    except Exception:
+        return 'unknown'
+
+
+def _get_user_agent():
+    try:
+        return (request.headers.get('User-Agent') or '')[:500]
+    except Exception:
+        return ''
+
+
+def _get_request_body_safe():
+    try:
+        body = request.get_json(silent=True)
+        if body:
+            return json.dumps(body, ensure_ascii=False)[:4000]
+    except Exception:
+        pass
+    try:
+        raw = request.get_data(as_text=True)
+        if raw:
+            return raw[:4000]
+    except Exception:
+        pass
+    return ''
+
+
+def _audit_log(action, result, sheet=None, authorization=None,
+               block_reason=None, block_code=None,
+               response_status=None, response_message=None,
+               detail=None, user=None):
+    try:
+        current_user = user or g.get('current_user')
+        sheet_id = None
+        sheet_no = None
+        if sheet:
+            sheet_id = sheet.id
+            sheet_no = sheet.sheet_no
+        elif authorization:
+            sheet_id = authorization.sheet_id
+            s = HandoverSheet.query.get(authorization.sheet_id)
+            if s:
+                sheet_no = s.sheet_no
+
+        try:
+            req_params = request.args.to_dict() if request else {}
+            req_params_str = json.dumps(req_params, ensure_ascii=False)[:2000] if req_params else ''
+            req_path = request.path if request else ''
+            req_method = request.method if request else ''
+        except Exception:
+            req_params_str = ''
+            req_path = ''
+            req_method = ''
+
+        log = HandoverAuditLog(
+            sheet_id=sheet_id,
+            sheet_no=sheet_no,
+            authorization_id=authorization.id if authorization else None,
+            action=action,
+            result=result,
+            block_reason=block_reason,
+            block_code=block_code,
+            user_id=current_user.id if current_user else None,
+            user_name=current_user.username if current_user else None,
+            user_role=current_user.role if current_user else None,
+            client_ip=_get_client_ip(),
+            user_agent=_get_user_agent(),
+            request_path=req_path,
+            request_method=req_method,
+            request_params=req_params_str,
+            request_body=_get_request_body_safe(),
+            response_status=response_status,
+            response_message=response_message,
+            detail=detail,
+        )
+        db.session.add(log)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+
+
+def _check_can_view_sheet(sheet, user):
+    if not sheet or not user:
+        return False, 'NOT_FOUND', '交接单不存在'
+    if user.role == 'admin':
+        return True, None, None
+    scope = sheet.view_scope or 'assigned'
+    if scope == 'assigned':
+        if sheet.created_by == user.id:
+            return True, None, None
+        if sheet.assigned_to == user.id:
+            return True, None, None
+        active_auth = HandoverAuthorization.query.filter(
+            HandoverAuthorization.sheet_id == sheet.id,
+            HandoverAuthorization.token_type == 'view',
+            HandoverAuthorization.user_id == user.id,
+            HandoverAuthorization.revoked == False,
+            HandoverAuthorization.expires_at > datetime.utcnow(),
+        ).first()
+        if active_auth:
+            if active_auth.one_time and active_auth.is_used:
+                return False, 'TOKEN_USED', '查看凭证已使用，请联系管理员重新授权'
+            return True, None, None
+        return False, 'VIEW_NOT_AUTHORIZED', f'您无权查看此交接单（查看范围:仅指派人员）'
+    elif scope == 'store_all':
+        if sheet.store == (user.store_name if hasattr(user, 'store_name') else sheet.store):
+            return True, None, None
+        return False, 'VIEW_STORE_MISMATCH', f'此交接单仅门店"{sheet.store}"人员可查看'
+    elif scope == 'role_all':
+        return True, None, None
+    elif scope == 'specific':
+        if sheet.created_by == user.id or sheet.assigned_to == user.id:
+            return True, None, None
+        view_auth = HandoverAuthorization.query.filter(
+            HandoverAuthorization.sheet_id == sheet.id,
+            HandoverAuthorization.token_type == 'view',
+            HandoverAuthorization.user_id == user.id,
+            HandoverAuthorization.revoked == False,
+            HandoverAuthorization.expires_at > datetime.utcnow(),
+        ).first()
+        if view_auth:
+            if view_auth.one_time and view_auth.is_used:
+                return False, 'TOKEN_USED', '查看凭证已使用'
+            return True, None, None
+        return False, 'VIEW_NOT_AUTHORIZED', '您不在授权查看列表中'
+    return False, 'VIEW_NOT_AUTHORIZED', '您无权查看此交接单'
+
+
+def _validate_sign_token(token_str, sheet, user):
+    if not token_str:
+        return None, False, 'TOKEN_REQUIRED', '签收凭证不能为空'
+    auth = HandoverAuthorization.query.filter_by(auth_token=token_str).first()
+    if not auth:
+        return None, False, 'TOKEN_NOT_FOUND', '签收凭证不存在'
+    if auth.sheet_id != sheet.id:
+        return auth, False, 'TOKEN_SHEET_MISMATCH', '签收凭证与交接单不匹配'
+    if auth.token_type != 'sign':
+        return auth, False, 'TOKEN_TYPE_WRONG', f'凭证类型错误（需要签收凭证，当前为{auth.token_type}）'
+    if auth.revoked:
+        return auth, False, 'TOKEN_REVOKED', f'签收凭证已被撤回，原因: {auth.revoke_reason or "无"}'
+    now = datetime.utcnow()
+    if auth.expires_at < now:
+        return auth, False, 'TOKEN_EXPIRED', f'签收凭证已过期（过期时间: {auth.expires_at.strftime("%Y-%m-%d %H:%M:%S")}）'
+    if auth.one_time and auth.is_used:
+        return auth, False, 'TOKEN_USED', '签收凭证已被使用，一次性凭证不可重复使用'
+    if auth.user_id and auth.user_id != user.id:
+        expected_user = _get_username(auth.user_id)
+        return auth, False, 'TOKEN_USER_MISMATCH', f'此凭证仅限用户"{expected_user}"使用，请使用正确账号'
+    if auth.role_restriction and auth.role_restriction != user.role:
+        role_label = {'admin': '管理员', 'operator': '运营', 'clerk': '店员'}.get(auth.role_restriction, auth.role_restriction)
+        return auth, False, 'TOKEN_ROLE_MISMATCH', f'此凭证仅限{role_label}角色使用，您的角色不匹配'
+    return auth, True, None, None
+
+
+def _mark_auth_used(auth, user_id):
+    auth.is_used = True
+    auth.used_at = datetime.utcnow()
+    auth.used_by = user_id
+
+
+def _generate_auth_token(sheet_id, token_type, user_id=None,
+                         role_restriction=None, store_restriction=None,
+                         valid_hours=24, one_time=True, created_by=None,
+                         remark=None, generation_id=None):
+    now = datetime.utcnow()
+    expires_at = now + timedelta(hours=valid_hours)
+    token_str = f'H{token_type.upper()[0]}{now.strftime("%Y%m%d%H%M%S")}{uuid.uuid4().hex[:12].upper()}'
+    auth = HandoverAuthorization(
+        sheet_id=sheet_id,
+        auth_token=token_str,
+        token_type=token_type,
+        user_id=user_id,
+        role_restriction=role_restriction,
+        store_restriction=store_restriction,
+        expires_at=expires_at,
+        is_used=False,
+        created_by=created_by,
+        created_at=now,
+        remark=remark,
+        one_time=one_time,
+        revoked=False,
+        generation_id=generation_id,
+    )
+    db.session.add(auth)
+    return auth
+
+
 @app.route('/api/export/labels', methods=['GET'])
 @require_login
 def export_labels():
@@ -1770,8 +1964,27 @@ def list_handover_sheets():
     store = request.args.get('store', '')
     sheet_no = request.args.get('sheet_no', '')
     has_conflict = request.args.get('has_conflict', '')
+    only_assigned = request.args.get('only_assigned', 'false').lower() == 'true'
 
+    user = g.current_user
     query = HandoverSheet.query
+
+    if user.role != 'admin':
+        subq = db.session.query(HandoverAuthorization.sheet_id).filter(
+            HandoverAuthorization.user_id == user.id,
+            HandoverAuthorization.revoked == False,
+            HandoverAuthorization.expires_at > datetime.utcnow()
+        ).distinct()
+        query = query.filter(
+            db.or_(
+                HandoverSheet.created_by == user.id,
+                HandoverSheet.assigned_to == user.id,
+                HandoverSheet.view_scope == 'role_all',
+                HandoverSheet.id.in_(subq)
+            )
+        )
+    if only_assigned:
+        query = query.filter(HandoverSheet.assigned_to == user.id)
     if status:
         query = query.filter_by(status=status)
     if store:
@@ -1790,6 +2003,7 @@ def list_handover_sheets():
         d['created_by_name'] = _get_username(r.created_by)
         d['signed_by_name'] = _get_username(r.signed_by)
         d['voided_by_name'] = _get_username(r.voided_by)
+        d['assigned_to_name'] = _get_username(r.assigned_to)
         result_list.append(d)
 
     return jsonify({
@@ -1802,21 +2016,99 @@ def list_handover_sheets():
 @require_login
 def get_handover_sheet_detail(sheet_id):
     sheet = HandoverSheet.query.get(sheet_id)
+    user = g.current_user
+    view_token = request.args.get('view_token', '')
+
     if not sheet:
-        return jsonify({'success': False, 'message': '交接单不存在'}), 404
+        _audit_log('view_detail', 'blocked', sheet=sheet, block_reason='交接单不存在',
+                   block_code='NOT_FOUND', response_status=404, response_message='交接单不存在')
+        db.session.commit()
+        return jsonify({'success': False, 'message': '交接单不存在', 'code': 'NOT_FOUND'}), 404
+
+    can_view, block_code, block_reason = _check_can_view_sheet(sheet, user)
+    if not can_view:
+        if view_token:
+            v_auth = HandoverAuthorization.query.filter_by(auth_token=view_token).first()
+            if v_auth and v_auth.token_type == 'view' and v_auth.sheet_id == sheet_id and not v_auth.revoked:
+                now = datetime.utcnow()
+                if v_auth.expires_at >= now:
+                    if v_auth.user_id and v_auth.user_id != user.id:
+                        expected = _get_username(v_auth.user_id)
+                        _audit_log('view_detail', 'blocked', sheet=sheet, authorization=v_auth,
+                                   block_reason=f'查看凭证用户不匹配，仅限{expected}',
+                                   block_code='TOKEN_USER_MISMATCH',
+                                   response_status=403,
+                                   response_message=f'查看凭证仅限用户"{expected}"使用，请使用正确账号')
+                        db.session.commit()
+                        return jsonify({
+                            'success': False,
+                            'message': f'查看凭证仅限用户"{expected}"使用，请使用正确账号',
+                            'code': 'TOKEN_USER_MISMATCH'
+                        }), 403
+                    if v_auth.one_time and v_auth.is_used:
+                        _audit_log('view_detail', 'blocked', sheet=sheet, authorization=v_auth,
+                                   block_reason='查看凭证已使用', block_code='TOKEN_USED',
+                                   response_status=403, response_message='查看凭证已使用')
+                        db.session.commit()
+                        return jsonify({
+                            'success': False,
+                            'message': '查看凭证已使用，请联系管理员重新授权',
+                            'code': 'TOKEN_USED'
+                        }), 403
+                    can_view = True
+                    block_code = None
+                    block_reason = None
+                    if v_auth.one_time:
+                        _mark_auth_used(v_auth, user.id)
+
+    if not can_view:
+        _audit_log('view_detail', 'blocked', sheet=sheet,
+                   block_reason=block_reason, block_code=block_code,
+                   response_status=403, response_message=block_reason)
+        db.session.commit()
+        return jsonify({
+            'success': False,
+            'message': block_reason or '您无权查看此交接单',
+            'code': block_code or 'VIEW_NOT_AUTHORIZED'
+        }), 403
 
     _recalc_handover_conflict(sheet_id)
-    db.session.commit()
 
     d = sheet.to_dict(include_items=True)
     d['created_by_name'] = _get_username(sheet.created_by)
     d['signed_by_name'] = _get_username(sheet.signed_by)
     d['voided_by_name'] = _get_username(sheet.voided_by)
+    d['assigned_to_name'] = _get_username(sheet.assigned_to)
+    d['assigned_by_name'] = _get_username(sheet.assigned_by)
+    d['revoked_by_name'] = _get_username(sheet.revoked_by)
+    d['reopened_by_name'] = _get_username(sheet.reopened_by)
 
     logs = HandoverLog.query.filter_by(sheet_id=sheet_id).order_by(HandoverLog.created_at.desc()).all()
     d['logs'] = [log.to_dict() for log in logs]
     for log_entry in d['logs']:
         log_entry['operated_by_name'] = _get_username(log_entry['operated_by'])
+
+    authorizations = HandoverAuthorization.query.filter_by(sheet_id=sheet_id).order_by(
+        HandoverAuthorization.created_at.desc()).all()
+    d['authorizations'] = [a.to_dict() for a in authorizations]
+
+    receipts = HandoverReceipt.query.filter_by(sheet_id=sheet_id).order_by(
+        HandoverReceipt.signed_at.desc()).all()
+    d['receipts'] = [r.to_dict() for r in receipts]
+
+    can_sign = False
+    if sheet.status == 'pending' and sheet.revoke_status != 'revoked':
+        can_sign = (user.role == 'admin' or
+                    sheet.created_by == user.id or
+                    sheet.assigned_to == user.id)
+    d['can_sign'] = can_sign
+    d['current_user_role'] = user.role
+    d['current_user_id'] = user.id
+    d['current_user_name'] = user.username
+
+    _audit_log('view_detail', 'allowed', sheet=sheet,
+               detail=f'用户{user.username}成功查看交接单详情')
+    db.session.commit()
 
     return jsonify({'success': True, 'data': d})
 
@@ -1932,23 +2224,124 @@ def create_handover_sheet():
 @require_roles('admin', 'operator', 'clerk')
 def sign_handover_sheet(sheet_id):
     data = request.get_json() or {}
+    sign_token = (data.get('sign_token') or '').strip()
+    signer_remark = (data.get('signer_remark') or '').strip()
     sheet = HandoverSheet.query.get(sheet_id)
-    if not sheet:
-        return jsonify({'success': False, 'message': '交接单不存在'}), 404
-
-    if sheet.status != 'pending':
-        return jsonify({'success': False, 'message': f'交接单状态为{HANDOVER_STATUS_MAP.get(sheet.status, sheet.status)}，无法签收'}), 400
-
     user = g.current_user
     now = datetime.utcnow()
 
-    conflict_items = HandoverItem.query.filter_by(sheet_id=sheet_id, is_conflict=True).count()
-    if conflict_items > 0:
+    if not sheet:
+        _audit_log('sign', 'blocked', sheet=sheet, block_reason='交接单不存在',
+                   block_code='NOT_FOUND', response_status=404, response_message='交接单不存在')
+        db.session.commit()
+        return jsonify({'success': False, 'message': '交接单不存在', 'code': 'NOT_FOUND'}), 404
+
+    if sheet.status == 'voided':
+        _audit_log('sign', 'blocked', sheet=sheet,
+                   block_reason='交接单已作废，不能签收',
+                   block_code='VOIDED_SHEET',
+                   response_status=400, response_message='交接单已作废')
+        db.session.commit()
         return jsonify({
             'success': False,
-            'message': f'交接单中有{conflict_items}项冲突项，请先处理冲突后再签收',
+            'message': '交接单已作废，无法签收',
+            'code': 'VOIDED_SHEET',
+        }), 400
+
+    if sheet.revoke_status == 'revoked':
+        _audit_log('sign', 'blocked', sheet=sheet,
+                   block_reason='交接单签收权已被撤回',
+                   block_code='REVOKED_SIGN',
+                   response_status=400, response_message='交接单签收权已被撤回')
+        db.session.commit()
+        return jsonify({
+            'success': False,
+            'message': '交接单签收权已被撤回，无法签收',
+            'code': 'REVOKED_SIGN',
+        }), 400
+
+    if sheet.status == 'signed':
+        _audit_log('sign', 'blocked', sheet=sheet,
+                   block_reason='交接单已签收，不能重复签收',
+                   block_code='ALREADY_SIGNED',
+                   response_status=400, response_message='交接单已签收')
+        db.session.commit()
+        return jsonify({
+            'success': False,
+            'message': '交接单已签收，不能重复签收',
+            'code': 'ALREADY_SIGNED',
+        }), 400
+
+    if sheet.status != 'pending':
+        _audit_log('sign', 'blocked', sheet=sheet,
+                   block_reason=f'交接单状态异常:{sheet.status}',
+                   block_code='STATUS_INVALID',
+                   response_status=400,
+                   response_message=f'交接单状态为{HANDOVER_STATUS_MAP.get(sheet.status, sheet.status)}')
+        db.session.commit()
+        return jsonify({
+            'success': False,
+            'message': f'交接单状态为{HANDOVER_STATUS_MAP.get(sheet.status, sheet.status)}，无法签收',
+            'code': 'STATUS_INVALID',
+        }), 400
+
+    conflict_items_count = HandoverItem.query.filter_by(sheet_id=sheet_id, is_conflict=True).count()
+    if conflict_items_count > 0:
+        _audit_log('sign', 'blocked', sheet=sheet,
+                   block_reason=f'交接单有{conflict_items_count}项冲突',
+                   block_code='CONFLICT_EXISTS',
+                   response_status=400,
+                   response_message=f'有{conflict_items_count}项冲突')
+        db.session.commit()
+        return jsonify({
+            'success': False,
+            'message': f'交接单中有{conflict_items_count}项冲突项，请先处理冲突后再签收',
             'code': 'CONFLICT_EXISTS',
         }), 400
+
+    validated_auth = None
+    if user.role != 'admin':
+        is_assigned = (sheet.assigned_to == user.id) or (sheet.created_by == user.id)
+        if not sign_token and not is_assigned:
+            if sheet.view_scope == 'assigned':
+                _audit_log('sign', 'blocked', sheet=sheet,
+                           block_reason='没有签收权限且未提供签收凭证',
+                           block_code='SIGN_NOT_ASSIGNED',
+                           response_status=403,
+                           response_message='您不是指派签收人，请提供签收凭证')
+                db.session.commit()
+                return jsonify({
+                    'success': False,
+                    'message': '您不是指派签收人，请使用签收凭证签收',
+                    'code': 'SIGN_NOT_ASSIGNED',
+                }), 403
+
+        if sign_token:
+            auth, token_ok, token_code, token_msg = _validate_sign_token(sign_token, sheet, user)
+            if not token_ok:
+                _audit_log('sign', 'blocked', sheet=sheet, authorization=auth,
+                           block_reason=token_msg, block_code=token_code,
+                           response_status=403, response_message=token_msg)
+                db.session.commit()
+                return jsonify({
+                    'success': False,
+                    'message': token_msg,
+                    'code': token_code,
+                }), 403
+            validated_auth = auth
+        else:
+            if not is_assigned:
+                _audit_log('sign', 'blocked', sheet=sheet,
+                           block_reason='不是指派签收人且未提供凭证',
+                           block_code='SIGN_NOT_AUTHORIZED',
+                           response_status=403,
+                           response_message='您没有签收权限')
+                db.session.commit()
+                return jsonify({
+                    'success': False,
+                    'message': '您没有签收权限，请联系管理员指派或获取签收凭证',
+                    'code': 'SIGN_NOT_AUTHORIZED',
+                }), 403
 
     sheet.status = 'signed'
     sheet.signed_by = user.id
@@ -1961,14 +2354,83 @@ def sign_handover_sheet(sheet_id):
         sheet_id=sheet.id,
         sheet_no=sheet.sheet_no,
         action='sign',
-        detail=f'签收交接单，签收人: {user.username}',
+        detail=f'签收交接单，签收人: {user.username}' + (f'，备注: {signer_remark}' if signer_remark else ''),
         operated_by=user.id,
         created_at=now,
     )
     db.session.add(log)
+
+    if validated_auth:
+        _mark_auth_used(validated_auth, user.id)
+
+    receipt_no = f'RCP{now.strftime("%Y%m%d%H%M%S")}{uuid.uuid4().hex[:8].upper()}'
+    sheet_snap = {
+        'id': sheet.id,
+        'sheet_no': sheet.sheet_no,
+        'title': sheet.title,
+        'store': sheet.store,
+        'status': sheet.status,
+        'total_items': sheet.total_items,
+        'remark': sheet.remark,
+        'created_by': sheet.created_by,
+        'created_at': sheet.created_at.isoformat() if sheet.created_at else None,
+        'signed_by': user.id,
+        'signed_at': now.isoformat(),
+        'assigned_to': sheet.assigned_to,
+        'view_scope': sheet.view_scope,
+    }
+    items_snap = []
+    for i in sheet.items:
+        items_snap.append({
+            'id': i.id,
+            'label_id': i.label_id,
+            'sku': i.snapshot_sku,
+            'store': i.snapshot_store,
+            'original_price': i.snapshot_original_price,
+            'promotion_price': i.snapshot_promotion_price,
+            'effective_from': i.snapshot_effective_from.isoformat() if i.snapshot_effective_from else None,
+            'effective_to': i.snapshot_effective_to.isoformat() if i.snapshot_effective_to else None,
+            'template': i.snapshot_template,
+            'label_version': i.snapshot_label_version,
+        })
+    hash_source = f"{receipt_no}|{sheet.id}|{user.id}|{now.isoformat()}|{len(items_snap)}"
+    receipt_hash = hashlib.sha256(hash_source.encode('utf-8')).hexdigest()
+
+    receipt = HandoverReceipt(
+        sheet_id=sheet.id,
+        receipt_no=receipt_no,
+        authorization_id=validated_auth.id if validated_auth else None,
+        signed_by=user.id,
+        signed_at=now,
+        signer_ip=_get_client_ip(),
+        signer_user_agent=_get_user_agent(),
+        signer_remark=signer_remark or None,
+        item_count=len(items_snap),
+        sheet_snapshot=json.dumps(sheet_snap, ensure_ascii=False),
+        items_snapshot=json.dumps(items_snap, ensure_ascii=False),
+        receipt_hash=receipt_hash,
+        export_count=0,
+    )
+    db.session.add(receipt)
+
+    _audit_log('sign', 'allowed', sheet=sheet, authorization=validated_auth,
+               response_status=200,
+               detail=f'成功签收，签收人:{user.username}，生成回执:{receipt_no}' + (f'，凭证ID:{validated_auth.id}' if validated_auth else ''))
+
     db.session.commit()
 
-    return jsonify({'success': True, 'message': '签收成功', 'data': {'sheet_id': sheet.id, 'signed_at': now.isoformat()}})
+    return jsonify({
+        'success': True,
+        'message': '签收成功，交接回执已生成',
+        'data': {
+            'sheet_id': sheet.id,
+            'signed_at': now.isoformat(),
+            'receipt_no': receipt_no,
+            'receipt_hash': receipt_hash,
+            'receipt_id': receipt.id,
+            'sign_token_used': sign_token is not None and sign_token != '',
+        }
+    })
 
 
 @app.route('/api/handover-sheets/<int:sheet_id>/void', methods=['POST'])
@@ -2240,6 +2702,816 @@ def export_handover_logs():
     return resp
 
 
+# ==================== 授权签收台接口 ====================
+@app.route('/api/handover-auth-station/summary', methods=['GET'])
+@require_login
+def auth_station_summary():
+    user = g.current_user
+    if user.role == 'admin':
+        pending_sheets = HandoverSheet.query.filter_by(status='pending').count()
+        signed_sheets = HandoverSheet.query.filter_by(status='signed').count()
+        voided_sheets = HandoverSheet.query.filter_by(status='voided').count()
+        assigned_to_me = 0
+    else:
+        pending_sheets = HandoverSheet.query.filter(
+            HandoverSheet.status == 'pending',
+            db.or_(
+                HandoverSheet.created_by == user.id,
+                HandoverSheet.assigned_to == user.id,
+                HandoverSheet.view_scope == 'role_all'
+            )
+        ).count()
+        signed_sheets = HandoverSheet.query.filter(
+            HandoverSheet.status == 'signed',
+            HandoverSheet.signed_by == user.id
+        ).count()
+        voided_sheets = 0
+        assigned_to_me = HandoverSheet.query.filter(
+            HandoverSheet.assigned_to == user.id,
+            HandoverSheet.status == 'pending'
+        ).count()
+
+    pending_authorizations = HandoverAuthorization.query.filter(
+        HandoverAuthorization.is_used == False,
+        HandoverAuthorization.revoked == False,
+        HandoverAuthorization.expires_at > datetime.utcnow()
+    ).count()
+    total_receipts = HandoverReceipt.query.count()
+
+    return jsonify({
+        'success': True,
+        'data': {
+            'pending_sheets': pending_sheets,
+            'signed_sheets': signed_sheets,
+            'voided_sheets': voided_sheets,
+            'assigned_to_me': assigned_to_me,
+            'pending_authorizations': pending_authorizations,
+            'total_receipts': total_receipts,
+        }
+    })
+
+
+@app.route('/api/handover-sheets/<int:sheet_id>/assign', methods=['POST'])
+@require_roles('admin')
+def assign_handover_sheet(sheet_id):
+    data = request.get_json() or {}
+    assigned_to = data.get('assigned_to')
+    view_scope = (data.get('view_scope') or 'assigned').strip()
+    remark = (data.get('remark') or '').strip()
+
+    sheet = HandoverSheet.query.get(sheet_id)
+    user = g.current_user
+    now = datetime.utcnow()
+
+    if not sheet:
+        _audit_log('assign', 'blocked', sheet=sheet, block_reason='交接单不存在',
+                   block_code='NOT_FOUND', response_status=404)
+        db.session.commit()
+        return jsonify({'success': False, 'message': '交接单不存在', 'code': 'NOT_FOUND'}), 404
+    if sheet.status == 'voided':
+        _audit_log('assign', 'blocked', sheet=sheet, block_reason='作废单不能指派',
+                   block_code='VOIDED_SHEET', response_status=400)
+        db.session.commit()
+        return jsonify({'success': False, 'message': '已作废的交接单不能指派', 'code': 'VOIDED_SHEET'}), 400
+
+    valid_scopes = ['assigned', 'store_all', 'role_all', 'specific']
+    if view_scope not in valid_scopes:
+        return jsonify({'success': False, 'message': f'view_scope必须是: {", ".join(valid_scopes)}'}), 400
+
+    target_user = None
+    if assigned_to:
+        try:
+            assigned_to = int(assigned_to)
+        except (ValueError, TypeError):
+            return jsonify({'success': False, 'message': 'assigned_to必须是用户ID整数'}), 400
+        target_user = User.query.get(assigned_to)
+        if not target_user:
+            _audit_log('assign', 'blocked', sheet=sheet, block_reason=f'用户ID{assigned_to}不存在',
+                       block_code='USER_NOT_FOUND', response_status=400)
+            db.session.commit()
+            return jsonify({'success': False, 'message': '指派用户不存在', 'code': 'USER_NOT_FOUND'}), 400
+        sheet.assigned_to = assigned_to
+
+    sheet.assigned_at = now
+    sheet.assigned_by = user.id
+    sheet.view_scope = view_scope
+
+    detail_parts = []
+    if assigned_to:
+        detail_parts.append(f'指派接手人:{target_user.username}')
+    detail_parts.append(f'查看范围:{view_scope}')
+    if remark:
+        detail_parts.append(f'备注:{remark}')
+
+    log = HandoverLog(
+        sheet_id=sheet.id,
+        sheet_no=sheet.sheet_no,
+        action='assign',
+        detail='；'.join(detail_parts),
+        operated_by=user.id,
+        created_at=now,
+    )
+    db.session.add(log)
+    _audit_log('assign', 'allowed', sheet=sheet, response_status=200,
+               detail=f'指派成功:接手人={target_user.username if target_user else "未指定"};范围={view_scope}')
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'message': '指派成功',
+        'data': {
+            'sheet_id': sheet.id,
+            'assigned_to': sheet.assigned_to,
+            'assigned_to_name': _get_username(sheet.assigned_to),
+            'view_scope': sheet.view_scope,
+            'assigned_at': now.isoformat(),
+        }
+    })
+
+
+@app.route('/api/handover-sheets/<int:sheet_id>/authorizations', methods=['GET'])
+@require_login
+def list_handover_authorizations(sheet_id):
+    sheet = HandoverSheet.query.get(sheet_id)
+    user = g.current_user
+
+    if not sheet:
+        return jsonify({'success': False, 'message': '交接单不存在'}), 404
+    if user.role != 'admin' and sheet.created_by != user.id and sheet.assigned_to != user.id:
+        return jsonify({'success': False, 'message': '无权限查看授权列表'}), 403
+
+    records = HandoverAuthorization.query.filter_by(sheet_id=sheet_id).order_by(
+        HandoverAuthorization.created_at.desc()).all()
+    return jsonify({
+        'success': True,
+        'data': {
+            'sheet_id': sheet_id,
+            'list': [r.to_dict() for r in records],
+            'total': len(records),
+        }
+    })
+
+
+@app.route('/api/handover-sheets/<int:sheet_id>/authorize', methods=['POST'])
+@require_roles('admin')
+def create_handover_authorization(sheet_id):
+    data = request.get_json() or {}
+    sheet = HandoverSheet.query.get(sheet_id)
+    user = g.current_user
+
+    if not sheet:
+        return jsonify({'success': False, 'message': '交接单不存在', 'code': 'NOT_FOUND'}), 404
+    if sheet.status == 'voided':
+        return jsonify({'success': False, 'message': '已作废交接单不能生成授权凭证', 'code': 'VOIDED_SHEET'}), 400
+
+    token_type = (data.get('token_type') or 'sign').strip()
+    if token_type not in ('sign', 'view', 'receipt'):
+        return jsonify({'success': False, 'message': 'token_type必须是sign/view/receipt'}), 400
+
+    target_user_id = data.get('user_id')
+    role_restriction = (data.get('role_restriction') or '').strip() or None
+    store_restriction = (data.get('store_restriction') or '').strip() or None
+    valid_hours = data.get('valid_hours', 24)
+    one_time = data.get('one_time', True)
+    remark = (data.get('remark') or '').strip() or None
+    batch_count = int(data.get('batch_count', 1))
+    specific_usernames = data.get('usernames', []) or []
+
+    try:
+        valid_hours = int(valid_hours)
+        if valid_hours <= 0 or valid_hours > 720:
+            raise ValueError()
+    except (ValueError, TypeError):
+        return jsonify({'success': False, 'message': 'valid_hours必须是1-720的整数小时'}), 400
+    try:
+        batch_count = int(batch_count)
+        if batch_count <= 0 or batch_count > 50:
+            raise ValueError()
+    except (ValueError, TypeError):
+        return jsonify({'success': False, 'message': 'batch_count必须是1-50的整数'}), 400
+
+    if target_user_id:
+        try:
+            target_user_id = int(target_user_id)
+        except (ValueError, TypeError):
+            return jsonify({'success': False, 'message': 'user_id必须是整数'}), 400
+        if not User.query.get(target_user_id):
+            return jsonify({'success': False, 'message': '指定user_id不存在', 'code': 'USER_NOT_FOUND'}), 400
+
+    users_to_create = []
+    if specific_usernames and isinstance(specific_usernames, list):
+        for uname in specific_usernames:
+            u = User.query.filter_by(username=str(uname).strip()).first()
+            if u:
+                users_to_create.append(u)
+
+    generation_id = f'GEN{datetime.now().strftime("%Y%m%d%H%M%S")}{uuid.uuid4().hex[:6].upper()}'
+    created_tokens = []
+
+    if users_to_create:
+        for tu in users_to_create:
+            auth = _generate_auth_token(
+                sheet_id=sheet_id,
+                token_type=token_type,
+                user_id=tu.id,
+                role_restriction=None,
+                store_restriction=store_restriction,
+                valid_hours=valid_hours,
+                one_time=one_time,
+                created_by=user.id,
+                remark=remark,
+                generation_id=generation_id,
+            )
+            created_tokens.append(auth)
+    else:
+        for _ in range(batch_count):
+            auth = _generate_auth_token(
+                sheet_id=sheet_id,
+                token_type=token_type,
+                user_id=target_user_id,
+                role_restriction=role_restriction,
+                store_restriction=store_restriction,
+                valid_hours=valid_hours,
+                one_time=one_time,
+                created_by=user.id,
+                remark=remark,
+                generation_id=generation_id,
+            )
+            created_tokens.append(auth)
+
+    db.session.flush()
+
+    type_cn = {'sign': '签收凭证', 'view': '查看凭证', 'receipt': '回执凭证'}
+    log = HandoverLog(
+        sheet_id=sheet.id,
+        sheet_no=sheet.sheet_no,
+        action=f'authorize_{token_type}',
+        detail=f'生成{len(created_tokens)}个{type_cn.get(token_type, token_type)}，有效期{valid_hours}小时，generation_id={generation_id}',
+        operated_by=user.id,
+    )
+    db.session.add(log)
+    for auth in created_tokens:
+        _audit_log(f'authorize_{token_type}', 'allowed', sheet=sheet, authorization=auth,
+                   response_status=200,
+                   detail=f'生成{type_cn.get(token_type, token_type)}: user={_get_username(auth.user_id)}; role={auth.role_restriction}; valid={valid_hours}h')
+
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'message': f'成功生成{len(created_tokens)}个授权凭证',
+        'data': {
+            'sheet_id': sheet_id,
+            'generation_id': generation_id,
+            'token_type': token_type,
+            'count': len(created_tokens),
+            'tokens': [a.to_dict() for a in created_tokens],
+        }
+    })
+
+
+@app.route('/api/handover-authorizations/validate', methods=['POST'])
+@require_login
+def validate_authorization_endpoint():
+    data = request.get_json() or {}
+    token_str = (data.get('token') or '').strip()
+    token_type = (data.get('token_type') or 'sign').strip()
+    user = g.current_user
+
+    if not token_str:
+        return jsonify({'success': False, 'message': 'token不能为空', 'code': 'TOKEN_REQUIRED',
+                        'data': {'valid': False}}), 400
+
+    auth = HandoverAuthorization.query.filter_by(auth_token=token_str).first()
+    now = datetime.utcnow()
+
+    if not auth:
+        _audit_log('validate_token', 'blocked', authorization=auth,
+                   block_reason='凭证不存在', block_code='TOKEN_NOT_FOUND')
+        db.session.commit()
+        return jsonify({
+            'success': True,
+            'data': {
+                'valid': False,
+                'code': 'TOKEN_NOT_FOUND',
+                'reason': '签收凭证不存在，请确认凭证是否正确',
+            }
+        })
+
+    sheet = HandoverSheet.query.get(auth.sheet_id)
+    result = {'valid': True}
+
+    if not sheet:
+        result['valid'] = False
+        result['code'] = 'SHEET_NOT_FOUND'
+        result['reason'] = '交接单已被删除'
+    elif auth.token_type != token_type:
+        result['valid'] = False
+        result['code'] = 'TOKEN_TYPE_WRONG'
+        result['reason'] = f'凭证类型不匹配，需要{token_type}，当前为{auth.token_type}'
+    elif auth.revoked:
+        result['valid'] = False
+        result['code'] = 'TOKEN_REVOKED'
+        result['reason'] = f'凭证已被撤回，原因: {auth.revoke_reason or "无"}'
+    elif auth.expires_at < now:
+        result['valid'] = False
+        result['code'] = 'TOKEN_EXPIRED'
+        result['reason'] = f'凭证已过期，过期时间: {auth.expires_at.strftime("%Y-%m-%d %H:%M:%S")}'
+    elif auth.one_time and auth.is_used:
+        result['valid'] = False
+        result['code'] = 'TOKEN_USED'
+        result['reason'] = '凭证已被使用过，一次性凭证不可重复使用'
+    elif auth.user_id and auth.user_id != user.id:
+        expected = _get_username(auth.user_id)
+        result['valid'] = False
+        result['code'] = 'TOKEN_USER_MISMATCH'
+        result['reason'] = f'此凭证仅限用户"{expected}"使用，您当前账号是"{user.username}"，账号不匹配'
+    elif auth.role_restriction and auth.role_restriction != user.role:
+        role_label = {'admin': '管理员', 'operator': '运营', 'clerk': '店员'}.get(auth.role_restriction, auth.role_restriction)
+        result['valid'] = False
+        result['code'] = 'TOKEN_ROLE_MISMATCH'
+        result['reason'] = f'此凭证仅限{role_label}使用，您的角色不匹配'
+    elif sheet and sheet.status == 'voided':
+        result['valid'] = False
+        result['code'] = 'VOIDED_SHEET'
+        result['reason'] = '交接单已作废，无法使用凭证'
+
+    if sheet:
+        result['sheet_id'] = sheet.id
+        result['sheet_no'] = sheet.sheet_no
+        result['sheet_title'] = sheet.title
+        result['sheet_store'] = sheet.store
+        result['sheet_status'] = sheet.status
+    result['auth_id'] = auth.id
+    result['auth_token'] = auth.auth_token
+    result['token_type'] = auth.token_type
+    result['expires_at'] = auth.expires_at.isoformat() if auth.expires_at else None
+    result['restricted_user'] = _get_username(auth.user_id) if auth.user_id else None
+    result['restricted_role'] = auth.role_restriction
+    result['is_used'] = auth.is_used
+    result['one_time'] = auth.one_time
+
+    _audit_log('validate_token', 'allowed' if result['valid'] else 'blocked',
+               sheet=sheet, authorization=auth,
+               block_code=result.get('code'),
+               block_reason=result.get('reason') if not result['valid'] else None,
+               response_status=200,
+               detail=f'校验token={token_str[:12]}... 结果={"通过" if result["valid"] else result.get("reason")}')
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'data': result
+    })
+
+
+@app.route('/api/handover-authorizations/<int:auth_id>/revoke', methods=['POST'])
+@require_roles('admin')
+def revoke_authorization(auth_id):
+    data = request.get_json() or {}
+    reason = (data.get('reason') or '').strip()
+    if not reason:
+        return jsonify({'success': False, 'message': '撤回原因不能为空', 'code': 'REASON_REQUIRED'}), 400
+
+    auth = HandoverAuthorization.query.get(auth_id)
+    if not auth:
+        return jsonify({'success': False, 'message': '授权凭证不存在', 'code': 'NOT_FOUND'}), 404
+    if auth.revoked:
+        return jsonify({'success': False, 'message': '凭证已被撤回，不能重复操作', 'code': 'ALREADY_REVOKED'}), 400
+
+    user = g.current_user
+    now = datetime.utcnow()
+    auth.revoked = True
+    auth.revoked_at = now
+    auth.revoked_by = user.id
+    auth.revoke_reason = reason
+
+    sheet = HandoverSheet.query.get(auth.sheet_id)
+    if sheet:
+        log = HandoverLog(
+            sheet_id=sheet.id,
+            sheet_no=sheet.sheet_no,
+            action='revoke_auth',
+            detail=f'撤回授权凭证ID={auth_id}，类型={auth.token_type}，原因: {reason}',
+            operated_by=user.id,
+        )
+        db.session.add(log)
+
+    _audit_log('revoke_auth', 'allowed', sheet=sheet, authorization=auth,
+               response_status=200,
+               detail=f'撤回凭证，原因: {reason}')
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'message': '凭证已撤回',
+        'data': {
+            'auth_id': auth.id,
+            'revoked_at': now.isoformat(),
+            'revoked_by': user.id,
+        }
+    })
+
+
+@app.route('/api/handover-sheets/<int:sheet_id>/revoke-sign', methods=['POST'])
+@require_roles('admin')
+def revoke_handover_sign(sheet_id):
+    data = request.get_json() or {}
+    reason = (data.get('reason') or '').strip()
+    if not reason:
+        return jsonify({'success': False, 'message': '撤回原因不能为空', 'code': 'REASON_REQUIRED'}), 400
+
+    sheet = HandoverSheet.query.get(sheet_id)
+    user = g.current_user
+    now = datetime.utcnow()
+
+    if not sheet:
+        return jsonify({'success': False, 'message': '交接单不存在', 'code': 'NOT_FOUND'}), 404
+    if sheet.status != 'signed':
+        return jsonify({'success': False, 'message': '只有已签收的交接单可以撤回签收', 'code': 'NOT_SIGNED'}), 400
+    if sheet.revoke_status == 'revoked':
+        return jsonify({'success': False, 'message': '签收已被撤回，不能重复操作', 'code': 'ALREADY_REVOKED'}), 400
+
+    sheet.revoke_status = 'revoked'
+    sheet.revoked_by = user.id
+    sheet.revoked_at = now
+    sheet.revoke_reason = reason
+
+    signer_name = _get_username(sheet.signed_by)
+
+    log = HandoverLog(
+        sheet_id=sheet.id,
+        sheet_no=sheet.sheet_no,
+        action='revoke_sign',
+        detail=f'撤回签收(原签收人:{signer_name}，原签收时间:{sheet.signed_at.strftime("%Y-%m-%d %H:%M:%S") if sheet.signed_at else ""})，原因: {reason}',
+        operated_by=user.id,
+    )
+    db.session.add(log)
+    _audit_log('revoke_sign', 'allowed', sheet=sheet, response_status=200,
+               detail=f'撤回签收，原签收人={signer_name}, 原因={reason}')
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'message': '签收已撤回，可以重新签收',
+        'data': {
+            'sheet_id': sheet.id,
+            'revoke_status': 'revoked',
+            'revoked_at': now.isoformat(),
+            'original_signer': signer_name,
+        }
+    })
+
+
+@app.route('/api/handover-sheets/<int:sheet_id>/reopen', methods=['POST'])
+@require_roles('admin')
+def reopen_handover_sheet(sheet_id):
+    data = request.get_json() or {}
+    remark = (data.get('remark') or '').strip()
+    sheet = HandoverSheet.query.get(sheet_id)
+    user = g.current_user
+    now = datetime.utcnow()
+
+    if not sheet:
+        return jsonify({'success': False, 'message': '交接单不存在', 'code': 'NOT_FOUND'}), 404
+    if sheet.revoke_status != 'revoked':
+        return jsonify({'success': False, 'message': '只有撤回签收后的交接单可以重开', 'code': 'NOT_REVOKED'}), 400
+    if sheet.status == 'voided':
+        return jsonify({'success': False, 'message': '已作废交接单不能重开', 'code': 'VOIDED'}), 400
+
+    sheet.status = 'pending'
+    sheet.revoke_status = 'reopened'
+    sheet.reopened_by = user.id
+    sheet.reopened_at = now
+    sheet.signed_by = None
+    sheet.signed_at = None
+
+    for item in sheet.items:
+        item.print_status = 'pending'
+
+    log = HandoverLog(
+        sheet_id=sheet.id,
+        sheet_no=sheet.sheet_no,
+        action='reopen',
+        detail=f'重开交接单(从撤回签收状态恢复为待签收)，原撤回原因: {sheet.revoke_reason or ""}' + (f'，备注: {remark}' if remark else ''),
+        operated_by=user.id,
+    )
+    db.session.add(log)
+    _audit_log('reopen', 'allowed', sheet=sheet, response_status=200,
+               detail='重开成功，状态改为pending')
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'message': '交接单已重开，可以重新签收',
+        'data': {
+            'sheet_id': sheet.id,
+            'new_status': 'pending',
+            'reopened_at': now.isoformat(),
+        }
+    })
+
+
+@app.route('/api/handover-receipts', methods=['GET'])
+@require_login
+def list_handover_receipts():
+    page = request.args.get('page', 1, type=int)
+    size = request.args.get('size', 20, type=int)
+    receipt_no = request.args.get('receipt_no', '')
+    sheet_no = request.args.get('sheet_no', '')
+    signed_by = request.args.get('signed_by', '', type=int)
+
+    query = HandoverReceipt.query
+    if receipt_no:
+        query = query.filter(HandoverReceipt.receipt_no.like(f'%{receipt_no}%'))
+    if sheet_no:
+        query = query.join(HandoverSheet).filter(HandoverSheet.sheet_no.like(f'%{sheet_no}%'))
+    if signed_by:
+        query = query.filter_by(signed_by=signed_by)
+
+    total = query.count()
+    records = query.order_by(HandoverReceipt.signed_at.desc()).offset((page - 1) * size).limit(size).all()
+
+    result_list = []
+    for r in records:
+        d = r.to_dict()
+        s = HandoverSheet.query.get(r.sheet_id)
+        if s:
+            d['sheet_no'] = s.sheet_no
+            d['sheet_title'] = s.title
+            d['sheet_store'] = s.store
+        result_list.append(d)
+
+    return jsonify({
+        'success': True,
+        'data': {'list': result_list, 'total': total}
+    })
+
+
+@app.route('/api/handover-receipts/<int:receipt_id>', methods=['GET'])
+@require_login
+def get_handover_receipt_detail(receipt_id):
+    receipt = HandoverReceipt.query.get(receipt_id)
+    user = g.current_user
+    if not receipt:
+        return jsonify({'success': False, 'message': '回执不存在'}), 404
+
+    sheet = HandoverSheet.query.get(receipt.sheet_id)
+    if user.role != 'admin':
+        if sheet and sheet.created_by != user.id and sheet.assigned_to != user.id and receipt.signed_by != user.id:
+            return jsonify({'success': False, 'message': '无权限查看此回执'}), 403
+
+    d = receipt.to_dict(include_snapshot=True)
+    if sheet:
+        d['sheet_no'] = sheet.sheet_no
+        d['sheet_title'] = sheet.title
+        d['sheet_store'] = sheet.store
+        d['sheet_status'] = sheet.status
+        d['sheet_created_by_name'] = _get_username(sheet.created_by)
+        d['sheet_assigned_to_name'] = _get_username(sheet.assigned_to)
+    return jsonify({'success': True, 'data': d})
+
+
+@app.route('/api/handover-audit-logs', methods=['GET'])
+@require_roles('admin')
+def list_handover_audit_logs():
+    page = request.args.get('page', 1, type=int)
+    size = request.args.get('size', 20, type=int)
+    sheet_no = request.args.get('sheet_no', '')
+    action = request.args.get('action', '')
+    result_filter = request.args.get('result', '')
+    user_name = request.args.get('user_name', '')
+    block_code = request.args.get('block_code', '')
+
+    query = HandoverAuditLog.query
+    if sheet_no:
+        query = query.filter(HandoverAuditLog.sheet_no.like(f'%{sheet_no}%'))
+    if action:
+        query = query.filter_by(action=action)
+    if result_filter:
+        query = query.filter_by(result=result_filter)
+    if user_name:
+        query = query.filter(HandoverAuditLog.user_name.like(f'%{user_name}%'))
+    if block_code:
+        query = query.filter(HandoverAuditLog.block_code.like(f'%{block_code}%'))
+
+    total = query.count()
+    records = query.order_by(HandoverAuditLog.created_at.desc()).offset(
+        (page - 1) * size).limit(size).all()
+
+    return jsonify({
+        'success': True,
+        'data': {
+            'list': [r.to_dict() for r in records],
+            'total': total,
+            'allowed_count': HandoverAuditLog.query.filter_by(result='allowed').count(),
+            'blocked_count': HandoverAuditLog.query.filter_by(result='blocked').count(),
+        }
+    })
+
+
+@app.route('/api/handover-audit-logs/timeline', methods=['GET'])
+@require_login
+def handover_audit_timeline():
+    sheet_id = request.args.get('sheet_id', type=int)
+    sheet_no = request.args.get('sheet_no', '')
+    if not sheet_id and not sheet_no:
+        return jsonify({'success': False, 'message': '请提供sheet_id或sheet_no'}), 400
+
+    query = HandoverAuditLog.query
+    if sheet_id:
+        query = query.filter_by(sheet_id=sheet_id)
+    if sheet_no:
+        query = query.filter(HandoverAuditLog.sheet_no.like(f'%{sheet_no}%'))
+
+    records = query.order_by(HandoverAuditLog.created_at.asc()).all()
+
+    action_cn = {
+        'assign': '指派接手人',
+        'authorize_sign': '生成签收凭证',
+        'authorize_view': '生成查看凭证',
+        'authorize_receipt': '生成回执凭证',
+        'validate_token': '校验凭证',
+        'revoke_auth': '撤回授权',
+        'revoke_sign': '撤回签收',
+        'reopen': '重开交接单',
+        'sign': '签收',
+        'view_detail': '查看详情',
+        'create': '创建',
+        'void': '作废',
+        'check_conflict': '冲突检查',
+    }
+    result_cn = {'allowed': '放行', 'blocked': '拦截'}
+
+    events = []
+    for r in records:
+        events.append({
+            'id': r.id,
+            'time': r.created_at.isoformat() if r.created_at else None,
+            'action': r.action,
+            'action_name': action_cn.get(r.action, r.action),
+            'result': r.result,
+            'result_name': result_cn.get(r.result, r.result),
+            'user_name': r.user_name,
+            'user_role': r.user_role,
+            'block_code': r.block_code,
+            'block_reason': r.block_reason,
+            'client_ip': r.client_ip,
+            'detail': r.detail,
+            'response_status': r.response_status,
+        })
+
+    sheet = None
+    if sheet_id:
+        sheet = HandoverSheet.query.get(sheet_id)
+    elif sheet_no:
+        sheet = HandoverSheet.query.filter(HandoverSheet.sheet_no.like(f'%{sheet_no}%')).first()
+
+    authorizations = []
+    receipts = []
+    if sheet:
+        authorizations = [a.to_dict() for a in HandoverAuthorization.query.filter_by(
+            sheet_id=sheet.id).order_by(HandoverAuthorization.created_at.asc()).all()]
+        receipts = [r.to_dict() for r in HandoverReceipt.query.filter_by(
+            sheet_id=sheet.id).order_by(HandoverReceipt.signed_at.asc()).all()]
+
+    return jsonify({
+        'success': True,
+        'data': {
+            'sheet': sheet.to_dict() if sheet else None,
+            'events': events,
+            'authorizations': authorizations,
+            'receipts': receipts,
+            'total_events': len(events),
+            'blocked_count': sum(1 for e in events if e['result'] == 'blocked'),
+            'allowed_count': sum(1 for e in events if e['result'] == 'allowed'),
+        }
+    })
+
+
+@app.route('/api/export/handover-audit-logs', methods=['GET'])
+@require_roles('admin')
+def export_handover_audit_logs():
+    query = HandoverAuditLog.query.order_by(HandoverAuditLog.created_at.desc())
+    records = query.all()
+
+    action_cn = {
+        'assign': '指派接手人',
+        'authorize_sign': '生成签收凭证',
+        'authorize_view': '生成查看凭证',
+        'authorize_receipt': '生成回执凭证',
+        'validate_token': '校验凭证',
+        'revoke_auth': '撤回授权',
+        'revoke_sign': '撤回签收',
+        'reopen': '重开交接单',
+        'sign': '签收',
+        'view_detail': '查看详情',
+        'create': '创建',
+    }
+    result_cn = {'allowed': '放行', 'blocked': '拦截'}
+
+    rows = []
+    for r in records:
+        rows.append({
+            '日志ID': r.id,
+            '交接单ID': r.sheet_id or '',
+            '交接单号': r.sheet_no or '',
+            '操作类型': action_cn.get(r.action, r.action),
+            '处理结果': result_cn.get(r.result, r.result),
+            '拦截代码': r.block_code or '',
+            '拦截原因': r.block_reason or '',
+            '用户ID': r.user_id or '',
+            '用户名': r.user_name or '',
+            '用户角色': r.user_role or '',
+            '客户端IP': r.client_ip or '',
+            '请求路径': r.request_path or '',
+            '请求方法': r.request_method or '',
+            '请求参数': r.request_params or '',
+            '请求体': (r.request_body or '')[:200],
+            '响应状态': r.response_status or '',
+            '响应消息': (r.response_message or '')[:200],
+            '详细说明': (r.detail or '')[:200],
+            '操作时间': r.created_at.strftime('%Y-%m-%d %H:%M:%S') if r.created_at else '',
+        })
+
+    columns = ['日志ID', '交接单ID', '交接单号', '操作类型', '处理结果', '拦截代码', '拦截原因',
+               '用户ID', '用户名', '用户角色', '客户端IP', '请求路径', '请求方法',
+               '请求参数', '请求体', '响应状态', '响应消息', '详细说明', '操作时间']
+    df = pd.DataFrame(rows, columns=columns)
+    output = StringIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
+    output.seek(0)
+
+    resp = make_response(output.getvalue())
+    resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename=handover_audit_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
+    return resp
+
+
+@app.route('/api/export/handover-receipts', methods=['GET'])
+@require_login
+def export_handover_receipts():
+    query = HandoverReceipt.query.order_by(HandoverReceipt.signed_at.desc())
+    records = query.all()
+
+    rows = []
+    for r in records:
+        sheet = HandoverSheet.query.get(r.sheet_id)
+        rows.append({
+            '回执ID': r.id,
+            '回执编号': r.receipt_no,
+            '交接单ID': r.sheet_id,
+            '交接单号': sheet.sheet_no if sheet else '',
+            '交接单标题': sheet.title if sheet else '',
+            '门店': sheet.store if sheet else '',
+            '签收人': _get_username(r.signed_by),
+            '签收时间': r.signed_at.strftime('%Y-%m-%d %H:%M:%S') if r.signed_at else '',
+            '签收IP': r.signer_ip or '',
+            '签收人备注': r.signer_remark or '',
+            '价签数量': r.item_count,
+            '使用凭证ID': r.authorization_id or '',
+            '回执哈希': r.receipt_hash,
+            '导出次数': r.export_count,
+            '最后导出时间': r.last_exported_at.strftime('%Y-%m-%d %H:%M:%S') if r.last_exported_at else '',
+        })
+
+    columns = ['回执ID', '回执编号', '交接单ID', '交接单号', '交接单标题', '门店', '签收人',
+               '签收时间', '签收IP', '签收人备注', '价签数量', '使用凭证ID',
+               '回执哈希', '导出次数', '最后导出时间']
+    df = pd.DataFrame(rows, columns=columns)
+    output = StringIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
+    output.seek(0)
+
+    now = datetime.utcnow()
+    for r in records:
+        r.export_count = (r.export_count or 0) + 1
+        r.last_exported_at = now
+    db.session.commit()
+
+    resp = make_response(output.getvalue())
+    resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename=handover_receipts_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
+    return resp
+
+
+@app.route('/api/users/list', methods=['GET'])
+@require_login
+def list_users_for_assign():
+    query = User.query.order_by(User.id.asc())
+    users = []
+    role_label = {'admin': '管理员', 'operator': '运营', 'clerk': '店员'}
+    for u in query.all():
+        users.append({
+            'id': u.id,
+            'username': u.username,
+            'role': u.role,
+            'role_name': role_label.get(u.role, u.role),
+            'created_at': u.created_at.isoformat() if u.created_at else None,
+        })
+    return jsonify({'success': True, 'data': users})
+
+
 # ==================== 统计接口 ====================
 @app.route('/api/stats/overview', methods=['GET'])
 @require_login
@@ -2261,6 +3533,25 @@ def stats_overview():
     handover_voided = HandoverSheet.query.filter_by(status='voided').count()
     handover_conflict = HandoverSheet.query.filter_by(has_conflict=True).count()
 
+    now = datetime.utcnow()
+    auth_pending = HandoverAuthorization.query.filter(
+        HandoverAuthorization.token_type == 'sign',
+        HandoverAuthorization.revoked == False,
+        HandoverAuthorization.is_used == False,
+        HandoverAuthorization.expires_at >= now,
+    ).count()
+    auth_expired = HandoverAuthorization.query.filter(
+        HandoverAuthorization.expires_at < now,
+    ).count()
+    auth_revoked_count = HandoverAuthorization.query.filter_by(revoked=True).count()
+    auth_used_count = HandoverAuthorization.query.filter_by(is_used=True).count()
+    sign_revoked_count = HandoverSheet.query.filter_by(revoke_status='revoked').count()
+    sign_reopened_count = HandoverSheet.query.filter_by(revoke_status='reopened').count()
+    receipt_count = HandoverReceipt.query.count()
+    audit_allowed_count = HandoverAuditLog.query.filter_by(result='allowed').count()
+    audit_blocked_count = HandoverAuditLog.query.filter_by(result='blocked').count()
+    handover_assigned = HandoverSheet.query.filter(HandoverSheet.assigned_to.isnot(None)).count()
+
     return jsonify({
         'success': True,
         'data': {
@@ -2280,6 +3571,16 @@ def stats_overview():
             'handover_signed': handover_signed,
             'handover_voided': handover_voided,
             'handover_conflict': handover_conflict,
+            'handover_assigned': handover_assigned,
+            'auth_pending': auth_pending,
+            'auth_expired': auth_expired,
+            'auth_revoked_count': auth_revoked_count,
+            'auth_used_count': auth_used_count,
+            'sign_revoked_count': sign_revoked_count,
+            'sign_reopened_count': sign_reopened_count,
+            'receipt_count': receipt_count,
+            'audit_allowed_count': audit_allowed_count,
+            'audit_blocked_count': audit_blocked_count,
             'in_publish_window': is_in_publish_window()[0]
         }
     })
@@ -2425,14 +3726,32 @@ def _generate_drill_session_no():
     return f'DRILL{datetime.now().strftime("%Y%m%d%H%M%S")}{uuid.uuid4().hex[:6].upper()}'
 
 
-def _import_drill_demo_data(data_key, user_id):
+def _import_drill_demo_data(data_key, user_id, force_reset=False):
+    generation_id = f"GEN_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8].upper()}"
+
     existing = DrillDemoData.query.filter_by(data_key=data_key).first()
     if existing and existing.is_active:
-        return {
-            'success': False,
-            'message': f'演示数据"{data_key}"已存在，请勿重复导入',
-            'code': 'DUPLICATE_DATA',
-        }
+        if force_reset:
+            old_batch_id = existing.import_batch_id
+            if old_batch_id:
+                old_labels = PriceLabel.query.filter_by(batch_id=old_batch_id).all()
+                for label in old_labels:
+                    PrintQueue.query.filter_by(label_id=label.id).delete()
+                    RollbackHistory.query.filter_by(label_id=label.id).delete()
+                    RevocationLog.query.filter_by(label_id=label.id).delete()
+                    RevocationRequest.query.filter_by(label_id=label.id).delete()
+                    RevocationRequestLog.query.filter_by(label_id=label.id).delete()
+                    HandoverItem.query.filter_by(label_id=label.id).delete()
+                    db.session.delete(label)
+            DrillDemoData.query.filter_by(data_key=data_key).delete()
+            db.session.flush()
+        else:
+            return {
+                'success': False,
+                'message': f'演示数据"{data_key}"已存在，如需重新导入请先调用reset接口或使用force_reset=true参数',
+                'code': 'DUPLICATE_DATA',
+                'hint': 'POST /api/drill/demo-data/<data_key>/reset 或 body 中传 force_reset=true',
+            }
 
     template = DRILL_DEMO_DATA_TEMPLATES.get(data_key)
     if not template:
@@ -2451,7 +3770,7 @@ def _import_drill_demo_data(data_key, user_id):
     batch_no = f'DRILL{datetime.now().strftime("%Y%m%d%H%M%S")}{uuid.uuid4().hex[:6].upper()}'
     batch = ImportBatch(
         batch_no=batch_no,
-        filename=f'{data_key}.csv',
+        filename=f'{data_key}_{generation_id}.csv',
         total_rows=len(df),
         imported_by=user_id,
         status='completed',
@@ -2460,8 +3779,14 @@ def _import_drill_demo_data(data_key, user_id):
     db.session.flush()
 
     valid_count = 0
+    created_label_ids = []
     for idx, row in df.iterrows():
         row_dict = row.to_dict()
+        original_sku = str(row_dict.get('SKU', '')).strip()
+        if not original_sku.startswith('DRILL'):
+            original_sku = f'DRILL{original_sku}'
+        row_dict['SKU'] = f'{original_sku}_{generation_id[-8:]}'
+
         result = validate_label_row(row_dict, discount_floor, store_whitelist, check_overlap=False)
         parsed = result['parsed']
 
@@ -2506,21 +3831,26 @@ def _import_drill_demo_data(data_key, user_id):
             )
             db.session.add(label)
             valid_count += 1
+            created_label_ids.append((idx, original_sku, row_dict['SKU']))
 
     batch.valid_rows = valid_count
     batch.invalid_rows = len(df) - valid_count
     db.session.flush()
 
+    demo_content = {
+        'csv_content': csv_content,
+        'total_rows': len(df),
+        'valid_rows': valid_count,
+        'generation_id': generation_id,
+        'label_mappings': created_label_ids,
+    }
+
     demo_data = DrillDemoData(
         data_key=data_key,
-        data_name=template['name'],
-        description=template['description'],
+        data_name=template['name'] + f' (生成批次 {generation_id[-8:]})',
+        description=template['description'] + f' [generation_id={generation_id}]',
         data_type=template['data_type'],
-        content=json.dumps({
-            'csv_content': csv_content,
-            'total_rows': len(df),
-            'valid_rows': valid_count,
-        }, ensure_ascii=False),
+        content=json.dumps(demo_content, ensure_ascii=False),
         is_active=True,
         imported_by=user_id,
         imported_at=now,
@@ -2537,6 +3867,8 @@ def _import_drill_demo_data(data_key, user_id):
             'batch_no': batch_no,
             'total_rows': len(df),
             'valid_rows': valid_count,
+            'generation_id': generation_id,
+            'generation_short': generation_id[-8:],
         },
     }
 
@@ -2597,11 +3929,12 @@ def get_drill_demo_data_detail(data_key):
 def import_drill_demo_data():
     data = request.get_json() or {}
     data_key = data.get('data_key', '').strip()
+    force_reset = data.get('force_reset', False)
     if not data_key:
         return jsonify({'success': False, 'message': '请指定演示数据标识'}), 400
 
     user = g.current_user
-    result = _import_drill_demo_data(data_key, user.id)
+    result = _import_drill_demo_data(data_key, user.id, force_reset=force_reset)
 
     if not result['success']:
         return jsonify(result), 400
@@ -2611,8 +3944,17 @@ def import_drill_demo_data():
 @app.route('/api/drill/demo-data/<data_key>/reset', methods=['POST'])
 @require_roles('admin')
 def reset_drill_demo_data(data_key):
+    data = request.get_json() or {}
+    reimport = data.get('reimport', True)
+    user = g.current_user
+
     record = DrillDemoData.query.filter_by(data_key=data_key).first()
     if not record:
+        if reimport:
+            result = _import_drill_demo_data(data_key, user.id, force_reset=False)
+            if not result['success']:
+                return jsonify(result), 400
+            return jsonify({'success': True, 'message': '旧数据不存在，已直接导入新演示数据', 'data': result.get('data')})
         return jsonify({'success': False, 'message': '演示数据不存在'}), 404
 
     batch_id = record.import_batch_id
@@ -2628,9 +3970,24 @@ def reset_drill_demo_data(data_key):
             db.session.delete(label)
 
     DrillDemoData.query.filter_by(data_key=data_key).delete()
-    db.session.commit()
+    db.session.flush()
 
-    return jsonify({'success': True, 'message': '演示数据已重置'})
+    reimport_result = None
+    message = '演示数据已重置'
+    if reimport:
+        result = _import_drill_demo_data(data_key, user.id, force_reset=False)
+        if not result['success']:
+            db.session.commit()
+            return jsonify({'success': False, 'message': f'重置成功但重新导入失败: {result.get("message")}'}), 400
+        reimport_result = result.get('data')
+        message = '演示数据已重置并重新导入新批次数据'
+
+    db.session.commit()
+    return jsonify({
+        'success': True,
+        'message': message,
+        'data': reimport_result,
+    })
 
 
 @app.route('/api/drill/sessions', methods=['GET'])

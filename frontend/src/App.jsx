@@ -14,6 +14,8 @@ import {
   StopOutlined,
   SwapOutlined,
   PlayCircleOutlined,
+  SafetyCertificateOutlined,
+  VideoCameraOutlined,
 } from '@ant-design/icons'
 import Login from './pages/Login.jsx'
 import Dashboard from './pages/Dashboard.jsx'
@@ -30,6 +32,8 @@ import ConfigPage from './pages/ConfigPage.jsx'
 import HandoverSheetList from './pages/HandoverSheetList.jsx'
 import HandoverSheetDetail from './pages/HandoverSheetDetail.jsx'
 import HandoverLogPage from './pages/HandoverLogPage.jsx'
+import HandoverAuthStation from './pages/HandoverAuthStation.jsx'
+import HandoverPlayback from './pages/HandoverPlayback.jsx'
 import DrillCenter from './pages/DrillCenter.jsx'
 import DrillSessionPage from './pages/DrillSessionPage.jsx'
 import DrillHistoryPage from './pages/DrillHistoryPage.jsx'
@@ -48,6 +52,8 @@ const menuItems = [
   { key: '/revocation-approval', icon: <StopOutlined />, label: '撤销审批', roles: ['admin'] },
   { key: '/print-queue', icon: <PrinterOutlined />, label: '打印清单' },
   { key: '/handover-sheets', icon: <SwapOutlined />, label: '交接单管理' },
+  { key: '/handover-auth-station', icon: <SafetyCertificateOutlined />, label: '授权签收台' },
+  { key: '/handover-playback', icon: <VideoCameraOutlined />, label: '审计回放台', roles: ['admin'] },
   { key: '/handover-logs', icon: <SwapOutlined />, label: '交接单日志' },
   { key: '/rollback-history', icon: <HistoryOutlined />, label: '回滚历史' },
   { key: '/revocation-logs', icon: <StopOutlined />, label: '撤销日志' },
@@ -159,6 +165,8 @@ function AppContent() {
               <Route path="/revocation-logs" element={<RevocationLogPage />} />
               <Route path="/handover-sheets" element={<HandoverSheetList user={user} />} />
               <Route path="/handover-sheets/:id" element={<HandoverSheetDetail user={user} />} />
+              <Route path="/handover-auth-station" element={<HandoverAuthStation user={user} />} />
+              <Route path="/handover-playback" element={<HandoverPlayback user={user} />} />
               <Route path="/handover-logs" element={<HandoverLogPage />} />
               <Route path="/config" element={<ConfigPage user={user} />} />
               <Route path="*" element={<Navigate to="/dashboard" replace />} />

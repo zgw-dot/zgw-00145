@@ -315,12 +315,27 @@ class HandoverSheet(db.Model):
     void_reason = db.Column(db.Text)
     has_conflict = db.Column(db.Boolean, default=False)
     conflict_checked_at = db.Column(db.DateTime)
+    assigned_to = db.Column(db.Integer, db.ForeignKey('users.id'))
+    assigned_at = db.Column(db.DateTime)
+    assigned_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    view_scope = db.Column(db.String(20), default='assigned')  # assigned, store_all, role_all, specific
+    revoke_status = db.Column(db.String(20), default='none')  # none, revoking, revoked, reopened
+    revoked_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    revoked_at = db.Column(db.DateTime)
+    revoke_reason = db.Column(db.Text)
+    reopened_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    reopened_at = db.Column(db.DateTime)
 
     items = db.relationship('HandoverItem', backref='sheet', cascade='all, delete-orphan')
+    authorizations = db.relationship('HandoverAuthorization', backref='sheet', cascade='all, delete-orphan')
+    receipts = db.relationship('HandoverReceipt', backref='sheet', cascade='all, delete-orphan')
+    audit_logs = db.relationship('HandoverAuditLog', backref='sheet', cascade='all, delete-orphan')
 
     __table_args__ = (
         db.Index('idx_handover_store', 'store'),
         db.Index('idx_handover_status', 'status'),
+        db.Index('idx_handover_assigned', 'assigned_to'),
+        db.Index('idx_handover_revoke', 'revoke_status'),
     )
 
     def to_dict(self, include_items=False):
@@ -341,6 +356,16 @@ class HandoverSheet(db.Model):
             'void_reason': self.void_reason,
             'has_conflict': self.has_conflict,
             'conflict_checked_at': self.conflict_checked_at.isoformat() if self.conflict_checked_at else None,
+            'assigned_to': self.assigned_to,
+            'assigned_at': self.assigned_at.isoformat() if self.assigned_at else None,
+            'assigned_by': self.assigned_by,
+            'view_scope': self.view_scope,
+            'revoke_status': self.revoke_status,
+            'revoked_by': self.revoked_by,
+            'revoked_at': self.revoked_at.isoformat() if self.revoked_at else None,
+            'revoke_reason': self.revoke_reason,
+            'reopened_by': self.reopened_by,
+            'reopened_at': self.reopened_at.isoformat() if self.reopened_at else None,
         }
         if include_items:
             result['items'] = [item.to_dict() for item in self.items]
@@ -574,4 +599,170 @@ class DrillAcceptanceRecord(db.Model):
             'remark': self.remark,
             'checked_at': self.checked_at.isoformat() if self.checked_at else None,
             'checked_by': self.checked_by,
+        }
+
+
+class HandoverAuthorization(db.Model):
+    __tablename__ = 'handover_authorizations'
+    id = db.Column(db.Integer, primary_key=True)
+    sheet_id = db.Column(db.Integer, db.ForeignKey('handover_sheets.id'), nullable=False)
+    auth_token = db.Column(db.String(100), unique=True, nullable=False)
+    token_type = db.Column(db.String(20), default='sign')  # sign, view, receipt
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    role_restriction = db.Column(db.String(20))
+    store_restriction = db.Column(db.String(100))
+    expires_at = db.Column(db.DateTime, nullable=False)
+    is_used = db.Column(db.Boolean, default=False)
+    used_at = db.Column(db.DateTime)
+    used_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    remark = db.Column(db.Text)
+    one_time = db.Column(db.Boolean, default=True)
+    revoked = db.Column(db.Boolean, default=False)
+    revoked_at = db.Column(db.DateTime)
+    revoked_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    revoke_reason = db.Column(db.Text)
+    generation_id = db.Column(db.String(100))
+
+    user = db.relationship('User', foreign_keys=[user_id])
+
+    __table_args__ = (
+        db.Index('idx_auth_sheet', 'sheet_id'),
+        db.Index('idx_auth_token', 'auth_token'),
+        db.Index('idx_auth_user', 'user_id'),
+        db.Index('idx_auth_expires', 'expires_at'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'sheet_id': self.sheet_id,
+            'auth_token': self.auth_token,
+            'token_type': self.token_type,
+            'user_id': self.user_id,
+            'user_name': self.user.username if self.user else None,
+            'role_restriction': self.role_restriction,
+            'store_restriction': self.store_restriction,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'is_used': self.is_used,
+            'used_at': self.used_at.isoformat() if self.used_at else None,
+            'used_by': self.used_by,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'remark': self.remark,
+            'one_time': self.one_time,
+            'revoked': self.revoked,
+            'revoked_at': self.revoked_at.isoformat() if self.revoked_at else None,
+            'revoked_by': self.revoked_by,
+            'revoke_reason': self.revoke_reason,
+            'generation_id': self.generation_id,
+        }
+
+
+class HandoverReceipt(db.Model):
+    __tablename__ = 'handover_receipts'
+    id = db.Column(db.Integer, primary_key=True)
+    sheet_id = db.Column(db.Integer, db.ForeignKey('handover_sheets.id'), nullable=False)
+    receipt_no = db.Column(db.String(50), unique=True, nullable=False)
+    authorization_id = db.Column(db.Integer, db.ForeignKey('handover_authorizations.id'))
+    signed_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    signed_at = db.Column(db.DateTime, default=datetime.utcnow)
+    signer_ip = db.Column(db.String(50))
+    signer_user_agent = db.Column(db.String(500))
+    signer_remark = db.Column(db.Text)
+    item_count = db.Column(db.Integer, default=0)
+    sheet_snapshot = db.Column(db.Text)
+    items_snapshot = db.Column(db.Text)
+    receipt_hash = db.Column(db.String(128))
+    export_count = db.Column(db.Integer, default=0)
+    last_exported_at = db.Column(db.DateTime)
+
+    authorization = db.relationship('HandoverAuthorization', foreign_keys=[authorization_id])
+    signer = db.relationship('User', foreign_keys=[signed_by])
+
+    __table_args__ = (
+        db.Index('idx_receipt_sheet', 'sheet_id'),
+        db.Index('idx_receipt_no', 'receipt_no'),
+        db.Index('idx_receipt_signed_by', 'signed_by'),
+    )
+
+    def to_dict(self, include_snapshot=False):
+        result = {
+            'id': self.id,
+            'sheet_id': self.sheet_id,
+            'receipt_no': self.receipt_no,
+            'authorization_id': self.authorization_id,
+            'signed_by': self.signed_by,
+            'signed_by_name': self.signer.username if self.signer else None,
+            'signed_at': self.signed_at.isoformat() if self.signed_at else None,
+            'signer_ip': self.signer_ip,
+            'signer_user_agent': self.signer_user_agent,
+            'signer_remark': self.signer_remark,
+            'item_count': self.item_count,
+            'receipt_hash': self.receipt_hash,
+            'export_count': self.export_count,
+            'last_exported_at': self.last_exported_at.isoformat() if self.last_exported_at else None,
+        }
+        if include_snapshot:
+            result['sheet_snapshot'] = self.sheet_snapshot
+            result['items_snapshot'] = self.items_snapshot
+        return result
+
+
+class HandoverAuditLog(db.Model):
+    __tablename__ = 'handover_audit_logs'
+    id = db.Column(db.Integer, primary_key=True)
+    sheet_id = db.Column(db.Integer, db.ForeignKey('handover_sheets.id'))
+    sheet_no = db.Column(db.String(50))
+    authorization_id = db.Column(db.Integer, db.ForeignKey('handover_authorizations.id'))
+    action = db.Column(db.String(50), nullable=False)
+    result = db.Column(db.String(20), nullable=False)  # allowed, blocked
+    block_reason = db.Column(db.String(100))
+    block_code = db.Column(db.String(50))
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    user_name = db.Column(db.String(50))
+    user_role = db.Column(db.String(20))
+    client_ip = db.Column(db.String(50))
+    user_agent = db.Column(db.String(500))
+    request_path = db.Column(db.String(500))
+    request_method = db.Column(db.String(10))
+    request_params = db.Column(db.Text)
+    request_body = db.Column(db.Text)
+    response_status = db.Column(db.Integer)
+    response_message = db.Column(db.Text)
+    detail = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        db.Index('idx_audit_sheet', 'sheet_id'),
+        db.Index('idx_audit_action', 'action'),
+        db.Index('idx_audit_result', 'result'),
+        db.Index('idx_audit_user', 'user_id'),
+        db.Index('idx_audit_created', 'created_at'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'sheet_id': self.sheet_id,
+            'sheet_no': self.sheet_no,
+            'authorization_id': self.authorization_id,
+            'action': self.action,
+            'result': self.result,
+            'block_reason': self.block_reason,
+            'block_code': self.block_code,
+            'user_id': self.user_id,
+            'user_name': self.user_name,
+            'user_role': self.user_role,
+            'client_ip': self.client_ip,
+            'user_agent': self.user_agent,
+            'request_path': self.request_path,
+            'request_method': self.request_method,
+            'request_params': self.request_params,
+            'request_body': self.request_body,
+            'response_status': self.response_status,
+            'response_message': self.response_message,
+            'detail': self.detail,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
         }
