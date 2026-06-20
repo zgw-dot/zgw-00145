@@ -13,6 +13,7 @@ import {
   LogoutOutlined,
   StopOutlined,
   SwapOutlined,
+  PlayCircleOutlined,
 } from '@ant-design/icons'
 import Login from './pages/Login.jsx'
 import Dashboard from './pages/Dashboard.jsx'
@@ -29,12 +30,18 @@ import ConfigPage from './pages/ConfigPage.jsx'
 import HandoverSheetList from './pages/HandoverSheetList.jsx'
 import HandoverSheetDetail from './pages/HandoverSheetDetail.jsx'
 import HandoverLogPage from './pages/HandoverLogPage.jsx'
+import DrillCenter from './pages/DrillCenter.jsx'
+import DrillSessionPage from './pages/DrillSessionPage.jsx'
+import DrillHistoryPage from './pages/DrillHistoryPage.jsx'
+import DrillApiDocsPage from './pages/DrillApiDocsPage.jsx'
+import DrillChecklistPage from './pages/DrillChecklistPage.jsx'
 import api from './utils/api.js'
 
 const { Header, Sider, Content } = Layout
 
 const menuItems = [
   { key: '/dashboard', icon: <DashboardOutlined />, label: '工作台' },
+  { key: '/drill', icon: <PlayCircleOutlined />, label: '演练中心' },
   { key: '/import', icon: <ImportOutlined />, label: '导入批次' },
   { key: '/labels', icon: <UnorderedListOutlined />, label: '价签管理' },
   { key: '/approval', icon: <AuditOutlined />, label: '价签审批' },
@@ -136,6 +143,11 @@ function AppContent() {
             <Routes location={location}>
               <Route path="/" element={<Navigate to="/dashboard" replace />} />
               <Route path="/dashboard" element={<Dashboard user={user} />} />
+              <Route path="/drill" element={<DrillCenter user={user} />} />
+              <Route path="/drill/session/:id" element={<DrillSessionPage user={user} />} />
+              <Route path="/drill/history" element={<DrillHistoryPage />} />
+              <Route path="/drill/api-docs" element={<DrillApiDocsPage />} />
+              <Route path="/drill/checklist" element={<DrillChecklistPage />} />
               <Route path="/import" element={<ImportPage user={user} />} />
               <Route path="/import/:id" element={<ImportBatchDetail />} />
               <Route path="/labels" element={<LabelList user={user} />} />

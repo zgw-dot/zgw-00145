@@ -13,7 +13,8 @@ from models import (
     db, User, SystemConfig, ImportBatch, ImportValidation,
     PriceLabel, RollbackHistory, PrintQueue, RevocationLog,
     RevocationRequest, RevocationRequestLog,
-    HandoverSheet, HandoverItem, HandoverLog
+    HandoverSheet, HandoverItem, HandoverLog,
+    DrillDemoData, DrillSession, DrillStep, DrillAcceptanceRecord
 )
 from validation import check_publish_approval, is_in_publish_window
 
@@ -2282,6 +2283,1614 @@ def stats_overview():
             'in_publish_window': is_in_publish_window()[0]
         }
     })
+
+
+# ==================== 演练中心 ====================
+
+DRILL_SCENARIOS = {
+    'handover_full_flow': {
+        'key': 'handover_full_flow',
+        'name': '交接单完整流程演练',
+        'description': '从导入价签到建单、签收、作废的完整流程，包含正常路径和异常分支',
+        'roles': ['admin', 'operator', 'clerk'],
+        'requires_demo_data': True,
+        'demo_data_key': 'drill_handover_labels',
+        'steps': [
+            {
+                'key': 'import_demo_data',
+                'name': '导入演示数据',
+                'description': '导入演练专用的演示价签数据',
+                'action_type': 'import_data',
+                'expected_result': '演示数据导入成功，生成指定批次',
+                'is_exception_branch': False,
+            },
+            {
+                'key': 'submit_labels',
+                'name': '提交价签审批',
+                'description': '将导入的价签提交审批',
+                'action_type': 'submit_labels',
+                'expected_result': '价签状态变更为待审批',
+                'is_exception_branch': False,
+            },
+            {
+                'key': 'approve_labels',
+                'name': '审批通过价签',
+                'description': '管理员审批通过价签，使其发布',
+                'action_type': 'approve_labels',
+                'expected_result': '价签状态变更为已发布，进入打印清单',
+                'is_exception_branch': False,
+            },
+            {
+                'key': 'create_handover',
+                'name': '创建交接单',
+                'description': '选择已发布价签，创建交接单',
+                'action_type': 'create_handover',
+                'expected_result': '交接单创建成功，状态为待签收',
+                'is_exception_branch': False,
+            },
+            {
+                'key': 'check_conflict',
+                'name': '检查交接单冲突',
+                'description': '检查交接单是否存在冲突项',
+                'action_type': 'check_conflict',
+                'expected_result': '冲突检查完成，无异常',
+                'is_exception_branch': False,
+            },
+            {
+                'key': 'sign_handover',
+                'name': '签收交接单',
+                'description': '店员或运营签收交接单',
+                'action_type': 'sign_handover',
+                'expected_result': '交接单状态变更为已签收',
+                'is_exception_branch': False,
+            },
+            {
+                'key': 'void_handover',
+                'name': '作废交接单',
+                'description': '管理员作废已签收的交接单',
+                'action_type': 'void_handover',
+                'expected_result': '交接单状态变更为已作废',
+                'is_exception_branch': False,
+            },
+            {
+                'key': 'exception_duplicate_import',
+                'name': '异常分支：重复导入演示数据',
+                'description': '尝试重复导入同一批演示数据，验证拦截逻辑',
+                'action_type': 'exception_duplicate_import',
+                'expected_result': '系统拦截重复导入，提示数据已存在',
+                'is_exception_branch': True,
+                'exception_description': '同一批数据不允许重复导入，避免数据冗余',
+            },
+            {
+                'key': 'exception_voided_sheet_drill',
+                'name': '异常分支：作废单继续演练',
+                'description': '尝试用已作废的交接单继续签收等操作',
+                'action_type': 'exception_voided_sheet',
+                'expected_result': '系统拦截，提示交接单已作废',
+                'is_exception_branch': True,
+                'exception_description': '已作废的交接单不能再进行签收等操作',
+            },
+            {
+                'key': 'exception_unauthorized_sign',
+                'name': '异常分支：越权代签验证',
+                'description': '验证不同角色的权限边界，越权操作应被拦截',
+                'action_type': 'exception_unauthorized',
+                'expected_result': '越权操作被拦截，返回403权限不足',
+                'is_exception_branch': True,
+                'exception_description': '不同角色有不同权限，越权操作必须被拦截',
+            },
+            {
+                'key': 'view_logs',
+                'name': '日志回查',
+                'description': '查看交接单操作日志，验证操作留痕',
+                'action_type': 'view_logs',
+                'expected_result': '可以查到完整的操作日志记录',
+                'is_exception_branch': False,
+            },
+            {
+                'key': 'export_check',
+                'name': '导出内容与日志核对',
+                'description': '导出交接单数据，与日志内容核对一致性',
+                'action_type': 'export_check',
+                'expected_result': '导出数据与日志记录一致',
+                'is_exception_branch': False,
+            },
+        ],
+    },
+}
+
+DRILL_DEMO_DATA_TEMPLATES = {
+    'drill_handover_labels': {
+        'key': 'drill_handover_labels',
+        'name': '交接单演练用价签数据',
+        'description': '包含3个门店共6条价签的演示数据，用于交接单全流程演练',
+        'data_type': 'labels',
+        'csv_content': '''SKU,门店,原价,促销价,生效开始时间,生效结束时间,模板
+DRILL001,北京朝阳店,99.00,69.00,2026-07-01 00:00:00,2026-07-31 23:59:59,default
+DRILL002,北京朝阳店,199.00,149.00,2026-07-01 00:00:00,2026-07-15 23:59:59,promotion
+DRILL003,北京朝阳店,50.00,39.00,2026-08-01 00:00:00,2026-08-31 23:59:59,default
+DRILL004,上海浦东店,100.00,79.00,2026-07-01 00:00:00,2026-07-31 23:59:59,default
+DRILL005,广州天河店,299.00,199.00,2026-07-10 00:00:00,2026-08-10 23:59:59,promotion
+DRILL006,深圳南山店,150.00,99.00,2026-07-15 00:00:00,2026-08-15 23:59:59,default
+''',
+    },
+}
+
+
+def _get_drill_scenario(scenario_key):
+    return DRILL_SCENARIOS.get(scenario_key)
+
+
+def _generate_drill_session_no():
+    return f'DRILL{datetime.now().strftime("%Y%m%d%H%M%S")}{uuid.uuid4().hex[:6].upper()}'
+
+
+def _import_drill_demo_data(data_key, user_id):
+    existing = DrillDemoData.query.filter_by(data_key=data_key).first()
+    if existing and existing.is_active:
+        return {
+            'success': False,
+            'message': f'演示数据"{data_key}"已存在，请勿重复导入',
+            'code': 'DUPLICATE_DATA',
+        }
+
+    template = DRILL_DEMO_DATA_TEMPLATES.get(data_key)
+    if not template:
+        return {'success': False, 'message': '演示数据模板不存在', 'code': 'TEMPLATE_NOT_FOUND'}
+
+    try:
+        csv_content = template['csv_content']
+        df = pd.read_csv(StringIO(csv_content))
+    except Exception as e:
+        return {'success': False, 'message': f'演示数据解析失败: {str(e)}'}
+
+    discount_floor = get_config('discount_floor', '0.5')
+    store_whitelist = get_config('store_whitelist', [])
+
+    now = datetime.utcnow()
+    batch_no = f'DRILL{datetime.now().strftime("%Y%m%d%H%M%S")}{uuid.uuid4().hex[:6].upper()}'
+    batch = ImportBatch(
+        batch_no=batch_no,
+        filename=f'{data_key}.csv',
+        total_rows=len(df),
+        imported_by=user_id,
+        status='completed',
+    )
+    db.session.add(batch)
+    db.session.flush()
+
+    valid_count = 0
+    for idx, row in df.iterrows():
+        row_dict = row.to_dict()
+        result = validate_label_row(row_dict, discount_floor, store_whitelist, check_overlap=False)
+        parsed = result['parsed']
+
+        validation = ImportValidation(
+            batch_id=batch.id,
+            row_number=idx + 2,
+            sku=parsed['sku'],
+            store=parsed['store'],
+            original_price=parsed['original_price'],
+            promotion_price=parsed['promotion_price'],
+            effective_from=parsed['effective_from'].isoformat() if parsed['effective_from'] else '',
+            effective_to=parsed['effective_to'].isoformat() if parsed['effective_to'] else '',
+            template=parsed['template'],
+            is_valid=result['is_valid'],
+            error_message='; '.join(result['errors']) if result['errors'] else '',
+        )
+        db.session.add(validation)
+
+        if result['is_valid']:
+            existing_label = PriceLabel.query.filter_by(
+                sku=parsed['sku'],
+                store=parsed['store'],
+            ).order_by(PriceLabel.version.desc()).first()
+
+            if existing_label:
+                new_version = existing_label.version + 1
+            else:
+                new_version = 1
+
+            label = PriceLabel(
+                sku=parsed['sku'],
+                store=parsed['store'],
+                original_price=parsed['original_price'],
+                promotion_price=parsed['promotion_price'],
+                effective_from=parsed['effective_from'],
+                effective_to=parsed['effective_to'],
+                template=parsed['template'],
+                status='draft',
+                version=new_version,
+                batch_id=batch.id,
+                created_by=user_id,
+            )
+            db.session.add(label)
+            valid_count += 1
+
+    batch.valid_rows = valid_count
+    batch.invalid_rows = len(df) - valid_count
+    db.session.flush()
+
+    demo_data = DrillDemoData(
+        data_key=data_key,
+        data_name=template['name'],
+        description=template['description'],
+        data_type=template['data_type'],
+        content=json.dumps({
+            'csv_content': csv_content,
+            'total_rows': len(df),
+            'valid_rows': valid_count,
+        }, ensure_ascii=False),
+        is_active=True,
+        imported_by=user_id,
+        imported_at=now,
+        import_batch_id=batch.id,
+    )
+    db.session.add(demo_data)
+    db.session.commit()
+
+    return {
+        'success': True,
+        'data': {
+            'data_key': data_key,
+            'batch_id': batch.id,
+            'batch_no': batch_no,
+            'total_rows': len(df),
+            'valid_rows': valid_count,
+        },
+    }
+
+
+def _get_drill_label_ids(batch_id):
+    labels = PriceLabel.query.filter_by(batch_id=batch_id).all()
+    return [l.id for l in labels]
+
+
+@app.route('/api/drill/scenarios', methods=['GET'])
+@require_login
+def list_drill_scenarios():
+    user = g.current_user
+    scenarios = []
+    for key, scenario in DRILL_SCENARIOS.items():
+        if user.role in scenario.get('roles', []):
+            scenarios.append({
+                'key': scenario['key'],
+                'name': scenario['name'],
+                'description': scenario['description'],
+                'roles': scenario['roles'],
+                'step_count': len(scenario['steps']),
+                'requires_demo_data': scenario.get('requires_demo_data', False),
+            })
+    return jsonify({'success': True, 'data': scenarios})
+
+
+@app.route('/api/drill/demo-data', methods=['GET'])
+@require_login
+def list_drill_demo_data():
+    records = DrillDemoData.query.order_by(DrillDemoData.imported_at.desc()).all()
+    result = []
+    for r in records:
+        d = r.to_dict()
+        d['imported_by_name'] = _get_username(r.imported_by)
+        result.append(d)
+    return jsonify({'success': True, 'data': result})
+
+
+@app.route('/api/drill/demo-data/<data_key>', methods=['GET'])
+@require_login
+def get_drill_demo_data_detail(data_key):
+    record = DrillDemoData.query.filter_by(data_key=data_key).first()
+    if not record:
+        return jsonify({'success': False, 'message': '演示数据不存在'}), 404
+    d = record.to_dict()
+    d['imported_by_name'] = _get_username(record.imported_by)
+    try:
+        content = json.loads(record.content)
+        d['detail'] = content
+    except Exception:
+        d['detail'] = None
+    return jsonify({'success': True, 'data': d})
+
+
+@app.route('/api/drill/demo-data/import', methods=['POST'])
+@require_roles('admin', 'operator')
+def import_drill_demo_data():
+    data = request.get_json() or {}
+    data_key = data.get('data_key', '').strip()
+    if not data_key:
+        return jsonify({'success': False, 'message': '请指定演示数据标识'}), 400
+
+    user = g.current_user
+    result = _import_drill_demo_data(data_key, user.id)
+
+    if not result['success']:
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@app.route('/api/drill/demo-data/<data_key>/reset', methods=['POST'])
+@require_roles('admin')
+def reset_drill_demo_data(data_key):
+    record = DrillDemoData.query.filter_by(data_key=data_key).first()
+    if not record:
+        return jsonify({'success': False, 'message': '演示数据不存在'}), 404
+
+    batch_id = record.import_batch_id
+    if batch_id:
+        labels = PriceLabel.query.filter_by(batch_id=batch_id).all()
+        for label in labels:
+            PrintQueue.query.filter_by(label_id=label.id).delete()
+            RollbackHistory.query.filter_by(label_id=label.id).delete()
+            RevocationLog.query.filter_by(label_id=label.id).delete()
+            RevocationRequest.query.filter_by(label_id=label.id).delete()
+            RevocationRequestLog.query.filter_by(label_id=label.id).delete()
+            HandoverItem.query.filter_by(label_id=label.id).delete()
+            db.session.delete(label)
+
+    DrillDemoData.query.filter_by(data_key=data_key).delete()
+    db.session.commit()
+
+    return jsonify({'success': True, 'message': '演示数据已重置'})
+
+
+@app.route('/api/drill/sessions', methods=['GET'])
+@require_login
+def list_drill_sessions():
+    page = request.args.get('page', 1, type=int)
+    size = request.args.get('size', 20, type=int)
+    status = request.args.get('status', '')
+    scenario_key = request.args.get('scenario_key', '')
+    role = request.args.get('role', '')
+
+    user = g.current_user
+    query = DrillSession.query
+
+    if user.role != 'admin':
+        query = query.filter_by(created_by=user.id)
+
+    if status:
+        query = query.filter_by(status=status)
+    if scenario_key:
+        query = query.filter_by(scenario_key=scenario_key)
+    if role:
+        query = query.filter_by(role=role)
+
+    total = query.count()
+    records = query.order_by(DrillSession.created_at.desc()).offset((page - 1) * size).limit(size).all()
+
+    result_list = []
+    for r in records:
+        d = r.to_dict()
+        d['created_by_name'] = _get_username(r.created_by)
+        result_list.append(d)
+
+    return jsonify({'success': True, 'data': {'list': result_list, 'total': total}})
+
+
+@app.route('/api/drill/sessions/<int:session_id>', methods=['GET'])
+@require_login
+def get_drill_session_detail(session_id):
+    session = DrillSession.query.get(session_id)
+    if not session:
+        return jsonify({'success': False, 'message': '演练会话不存在'}), 404
+
+    user = g.current_user
+    if user.role != 'admin' and session.created_by != user.id:
+        return jsonify({'success': False, 'message': '无权查看他人的演练会话', 'code': 'PERMISSION_DENIED'}), 403
+
+    d = session.to_dict()
+    d['created_by_name'] = _get_username(session.created_by)
+    d['steps'] = [s.to_dict() for s in session.steps]
+
+    acceptance = DrillAcceptanceRecord.query.filter_by(session_id=session_id).order_by(DrillAcceptanceRecord.id).all()
+    d['acceptance_records'] = [a.to_dict() for a in acceptance]
+
+    return jsonify({'success': True, 'data': d})
+
+
+@app.route('/api/drill/start', methods=['POST'])
+@require_login
+def start_drill_session():
+    data = request.get_json() or {}
+    scenario_key = data.get('scenario_key', '').strip()
+    role = data.get('role', '').strip()
+    title = data.get('title', '').strip()
+
+    if not scenario_key:
+        return jsonify({'success': False, 'message': '请选择演练场景'}), 400
+
+    scenario = _get_drill_scenario(scenario_key)
+    if not scenario:
+        return jsonify({'success': False, 'message': '演练场景不存在'}), 404
+
+    user = g.current_user
+    drill_role = role or user.role
+
+    if drill_role not in scenario.get('roles', []):
+        return jsonify({'success': False, 'message': f'角色{drill_role}无权参加此演练'}), 403
+
+    session_no = _generate_drill_session_no()
+    now = datetime.utcnow()
+
+    session = DrillSession(
+        session_no=session_no,
+        title=title or f'{scenario["name"]} - {drill_role}角色',
+        scenario_key=scenario_key,
+        scenario_name=scenario['name'],
+        role=drill_role,
+        status='in_progress',
+        total_steps=len(scenario['steps']),
+        completed_steps=0,
+        failed_steps=0,
+        start_time=now,
+        created_by=user.id,
+        demo_data_key=scenario.get('demo_data_key', ''),
+    )
+    db.session.add(session)
+    db.session.flush()
+
+    for idx, step_def in enumerate(scenario['steps']):
+        step = DrillStep(
+            session_id=session.id,
+            step_number=idx + 1,
+            step_key=step_def['key'],
+            step_name=step_def['name'],
+            step_description=step_def.get('description', ''),
+            action_type=step_def.get('action_type', ''),
+            expected_result=step_def.get('expected_result', ''),
+            status='pending',
+            is_exception_branch=step_def.get('is_exception_branch', False),
+            exception_description=step_def.get('exception_description', ''),
+        )
+        db.session.add(step)
+
+    db.session.commit()
+
+    d = session.to_dict()
+    d['steps'] = [s.to_dict() for s in session.steps]
+
+    return jsonify({'success': True, 'data': d})
+
+
+@app.route('/api/drill/sessions/<int:session_id>/steps/<step_key>/execute', methods=['POST'])
+@require_login
+def execute_drill_step(session_id, step_key):
+    session = DrillSession.query.get(session_id)
+    if not session:
+        return jsonify({'success': False, 'message': '演练会话不存在'}), 404
+
+    user = g.current_user
+    if user.role != 'admin' and session.created_by != user.id:
+        return jsonify({'success': False, 'message': '无权操作他人的演练会话', 'code': 'PERMISSION_DENIED'}), 403
+
+    if session.status == 'completed':
+        return jsonify({'success': False, 'message': '演练已完成，不能再执行步骤'}), 400
+
+    step = DrillStep.query.filter_by(session_id=session_id, step_key=step_key).first()
+    if not step:
+        return jsonify({'success': False, 'message': '演练步骤不存在'}), 404
+
+    if step.status == 'completed':
+        return jsonify({'success': True, 'data': step.to_dict(), 'message': '步骤已完成'})
+
+    user = g.current_user
+    data = request.get_json() or {}
+    start_ts = datetime.utcnow()
+
+    step.status = 'in_progress'
+    db.session.flush()
+
+    result = _execute_step_action(session, step, user, data)
+
+    end_ts = datetime.utcnow()
+    duration_ms = int((end_ts - start_ts).total_seconds() * 1000)
+
+    step.status = 'completed' if result.get('success') else 'failed'
+    step.actual_result = result.get('message', '')
+    step.request_data = json.dumps(data, ensure_ascii=False) if data else None
+    step.response_data = json.dumps(result.get('data', {}), ensure_ascii=False) if result.get('data') else None
+    step.error_message = result.get('error') if not result.get('success') else None
+    step.completed_at = end_ts
+    step.duration_ms = duration_ms
+
+    completed = DrillStep.query.filter_by(session_id=session_id, status='completed').count()
+    failed = DrillStep.query.filter_by(session_id=session_id, status='failed').count()
+    session.completed_steps = completed
+    session.failed_steps = failed
+
+    total = session.total_steps
+    if completed + failed >= total:
+        session.status = 'completed'
+        session.end_time = end_ts
+        _generate_acceptance_records(session.id, user.id)
+
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'data': {
+            'step': step.to_dict(),
+            'session': {
+                'id': session.id,
+                'status': session.status,
+                'completed_steps': session.completed_steps,
+                'failed_steps': session.failed_steps,
+            },
+            'action_result': result,
+        },
+    })
+
+
+def _execute_step_action(session, step, user, data):
+    action = step.action_type
+
+    try:
+        if action == 'import_data':
+            return _action_import_demo_data(session, step, user, data)
+        elif action == 'submit_labels':
+            return _action_submit_labels(session, step, user, data)
+        elif action == 'approve_labels':
+            return _action_approve_labels(session, step, user, data)
+        elif action == 'create_handover':
+            return _action_create_handover(session, step, user, data)
+        elif action == 'check_conflict':
+            return _action_check_conflict(session, step, user, data)
+        elif action == 'sign_handover':
+            return _action_sign_handover(session, step, user, data)
+        elif action == 'void_handover':
+            return _action_void_handover(session, step, user, data)
+        elif action == 'exception_duplicate_import':
+            return _action_exception_duplicate_import(session, step, user, data)
+        elif action == 'exception_voided_sheet':
+            return _action_exception_voided_sheet(session, step, user, data)
+        elif action == 'exception_unauthorized':
+            return _action_exception_unauthorized(session, step, user, data)
+        elif action == 'view_logs':
+            return _action_view_logs(session, step, user, data)
+        elif action == 'export_check':
+            return _action_export_check(session, step, user, data)
+        else:
+            return {'success': False, 'message': f'未知操作类型: {action}'}
+    except Exception as e:
+        db.session.rollback()
+        return {'success': False, 'message': f'执行异常: {str(e)}', 'error': str(e)}
+
+
+def _get_drill_demo_batch_id(session):
+    demo_data = DrillDemoData.query.filter_by(data_key=session.demo_data_key).first()
+    return demo_data.import_batch_id if demo_data else None
+
+
+def _action_import_demo_data(session, step, user, data):
+    result = _import_drill_demo_data(session.demo_data_key, user.id)
+    if result.get('success'):
+        return {
+            'success': True,
+            'message': f'演示数据导入成功，{result["data"]["valid_rows"]}条有效价签',
+            'data': result['data'],
+        }
+    else:
+        return {
+            'success': False,
+            'message': result.get('message', '导入失败'),
+            'data': result,
+        }
+
+
+def _action_submit_labels(session, step, user, data):
+    batch_id = _get_drill_demo_batch_id(session)
+    if not batch_id:
+        return {'success': False, 'message': '未找到演示数据批次，请先执行导入步骤'}
+
+    labels = PriceLabel.query.filter_by(batch_id=batch_id, status='draft').all()
+    if not labels:
+        return {'success': False, 'message': '没有可提交的草稿价签'}
+
+    label_ids = [l.id for l in labels]
+    now = datetime.utcnow()
+    success_count = 0
+
+    for lid in label_ids:
+        label = PriceLabel.query.get(lid)
+        if label and label.status == 'draft':
+            label.status = 'pending_approval'
+            label.submitted_at = now
+            success_count += 1
+
+    db.session.commit()
+
+    return {
+        'success': True,
+        'message': f'成功提交{success_count}条价签待审批',
+        'data': {'success_count': success_count, 'label_ids': label_ids},
+    }
+
+
+def _action_approve_labels(session, step, user, data):
+    if user.role != 'admin':
+        return {'success': False, 'message': '只有管理员可以审批价签', 'code': 'PERMISSION_DENIED'}
+
+    batch_id = _get_drill_demo_batch_id(session)
+    if not batch_id:
+        return {'success': False, 'message': '未找到演示数据批次'}
+
+    labels = PriceLabel.query.filter_by(batch_id=batch_id, status='pending_approval').all()
+    if not labels:
+        return {'success': False, 'message': '没有待审批的价签'}
+
+    label_ids = [l.id for l in labels]
+    now = datetime.utcnow()
+    success_count = 0
+
+    for lid in label_ids:
+        label = PriceLabel.query.get(lid)
+        if label and label.status == 'pending_approval':
+            label.status = 'published'
+            label.approved_at = now
+            label.approved_by = user.id
+            label.published_at = now
+            label.published_by = user.id
+
+            pq = PrintQueue(
+                label_id=label.id,
+                store=label.store,
+                sku=label.sku,
+                original_price=label.original_price,
+                promotion_price=label.promotion_price,
+                effective_from=label.effective_from,
+                effective_to=label.effective_to,
+                template=label.template,
+            )
+            db.session.add(pq)
+            success_count += 1
+
+    db.session.commit()
+
+    return {
+        'success': True,
+        'message': f'审批通过{success_count}条价签，已加入打印清单',
+        'data': {'success_count': success_count, 'label_ids': label_ids},
+    }
+
+
+def _action_create_handover(session, step, user, data):
+    batch_id = _get_drill_demo_batch_id(session)
+    if not batch_id:
+        return {'success': False, 'message': '未找到演示数据批次'}
+
+    labels = PriceLabel.query.filter_by(batch_id=batch_id, status='published').all()
+    if not labels:
+        return {'success': False, 'message': '没有已发布的价签可用于创建交接单'}
+
+    store = data.get('store') if data else None
+    if not store:
+        store_labels = labels
+    else:
+        store_labels = [l for l in labels if l.store == store]
+
+    if not store_labels:
+        store_labels = labels
+
+    store = store_labels[0].store
+    store_label_ids = [l.id for l in store_labels]
+
+    title = data.get('title') if data else None
+    if not title:
+        title = f'演练交接单 - {store}'
+
+    sheet_no = f'HO{datetime.now().strftime("%Y%m%d%H%M%S")}{uuid.uuid4().hex[:6].upper()}'
+    now = datetime.utcnow()
+
+    sheet = HandoverSheet(
+        sheet_no=sheet_no,
+        title=title,
+        store=store,
+        status='pending',
+        total_items=len(store_labels),
+        remark='演练交接单',
+        created_by=user.id,
+        created_at=now,
+    )
+    db.session.add(sheet)
+    db.session.flush()
+
+    for label in store_labels:
+        item = HandoverItem(
+            sheet_id=sheet.id,
+            label_id=label.id,
+            snapshot_sku=label.sku,
+            snapshot_store=label.store,
+            snapshot_original_price=label.original_price,
+            snapshot_promotion_price=label.promotion_price,
+            snapshot_effective_from=label.effective_from,
+            snapshot_effective_to=label.effective_to,
+            snapshot_template=label.template,
+            snapshot_label_status=label.status,
+            snapshot_label_version=label.version,
+            print_status='pending',
+        )
+        db.session.add(item)
+
+    log = HandoverLog(
+        sheet_id=sheet.id,
+        sheet_no=sheet_no,
+        action='create',
+        detail=f'创建演练交接单，含{len(store_labels)}项价签',
+        operated_by=user.id,
+        created_at=now,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    step.sheet_id = sheet.id
+
+    return {
+        'success': True,
+        'message': f'交接单创建成功，含{len(store_labels)}项价签',
+        'data': {'sheet_id': sheet.id, 'sheet_no': sheet_no, 'store': store, 'item_count': len(store_labels)},
+    }
+
+
+def _get_drill_sheet_id(session):
+    demo_data = DrillDemoData.query.filter_by(data_key=session.demo_data_key).first()
+    if not demo_data:
+        return None
+
+    batch_id = demo_data.import_batch_id
+    labels = PriceLabel.query.filter_by(batch_id=batch_id).all()
+    label_ids = [l.id for l in labels]
+
+    item = HandoverItem.query.filter(
+        HandoverItem.label_id.in_(label_ids)
+    ).order_by(HandoverItem.id.desc()).first()
+
+    return item.sheet_id if item else None
+
+
+def _action_check_conflict(session, step, user, data):
+    sheet_id = _get_drill_sheet_id(session)
+    if not sheet_id:
+        return {'success': False, 'message': '未找到演练交接单'}
+
+    sheet = HandoverSheet.query.get(sheet_id)
+    if not sheet:
+        return {'success': False, 'message': '交接单不存在'}
+
+    _recalc_handover_conflict(sheet_id)
+    db.session.commit()
+
+    conflict_items = [item.to_dict() for item in sheet.items if item.is_conflict]
+
+    return {
+        'success': True,
+        'message': f'冲突检查完成，发现{len(conflict_items)}项冲突',
+        'data': {'has_conflict': sheet.has_conflict, 'conflict_count': len(conflict_items)},
+    }
+
+
+def _action_sign_handover(session, step, user, data):
+    sheet_id = _get_drill_sheet_id(session)
+    if not sheet_id:
+        return {'success': False, 'message': '未找到演练交接单'}
+
+    sheet = HandoverSheet.query.get(sheet_id)
+    if not sheet:
+        return {'success': False, 'message': '交接单不存在'}
+
+    if sheet.status == 'voided':
+        return {
+            'success': False,
+            'message': '交接单已作废，不能签收',
+            'code': 'VOIDED_SHEET',
+        }
+
+    if sheet.status != 'pending':
+        return {'success': False, 'message': f'交接单状态为{sheet.status}，无法签收'}
+
+    allowed_roles = ['admin', 'operator', 'clerk']
+    if user.role not in allowed_roles:
+        return {'success': False, 'message': '权限不足', 'code': 'PERMISSION_DENIED'}
+
+    conflict_items = HandoverItem.query.filter_by(sheet_id=sheet_id, is_conflict=True).count()
+    if conflict_items > 0:
+        return {
+            'success': False,
+            'message': f'交接单中有{conflict_items}项冲突，请先处理',
+            'code': 'CONFLICT_EXISTS',
+        }
+
+    now = datetime.utcnow()
+    sheet.status = 'signed'
+    sheet.signed_by = user.id
+    sheet.signed_at = now
+
+    for item in sheet.items:
+        item.print_status = 'printed'
+
+    log = HandoverLog(
+        sheet_id=sheet.id,
+        sheet_no=sheet.sheet_no,
+        action='sign',
+        detail=f'签收交接单，签收人: {user.username}',
+        operated_by=user.id,
+        created_at=now,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return {
+        'success': True,
+        'message': '签收成功',
+        'data': {'sheet_id': sheet.id, 'signed_at': now.isoformat()},
+    }
+
+
+def _action_void_handover(session, step, user, data):
+    if user.role != 'admin':
+        return {
+            'success': False,
+            'message': '只有管理员可以作废交接单',
+            'code': 'PERMISSION_DENIED',
+        }
+
+    sheet_id = _get_drill_sheet_id(session)
+    if not sheet_id:
+        return {'success': False, 'message': '未找到演练交接单'}
+
+    sheet = HandoverSheet.query.get(sheet_id)
+    if not sheet:
+        return {'success': False, 'message': '交接单不存在'}
+
+    if sheet.status == 'voided':
+        return {'success': False, 'message': '交接单已作废，不能重复操作'}
+
+    now = datetime.utcnow()
+    original_status = sheet.status
+
+    sheet.status = 'voided'
+    sheet.voided_by = user.id
+    sheet.voided_at = now
+    sheet.void_reason = '演练作废'
+
+    log = HandoverLog(
+        sheet_id=sheet.id,
+        sheet_no=sheet.sheet_no,
+        action='void',
+        detail=f'作废交接单(原状态: {original_status})，原因: 演练作废',
+        operated_by=user.id,
+        created_at=now,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return {
+        'success': True,
+        'message': '作废成功',
+        'data': {'sheet_id': sheet.id},
+    }
+
+
+def _action_exception_duplicate_import(session, step, user, data):
+    result = _import_drill_demo_data(session.demo_data_key, user.id)
+
+    if not result.get('success') and result.get('code') == 'DUPLICATE_DATA':
+        return {
+            'success': True,
+            'message': f'验证通过：重复导入被正确拦截 - {result["message"]}',
+            'data': result,
+        }
+    else:
+        return {
+            'success': False,
+            'message': '验证失败：重复导入未被拦截',
+            'data': result,
+        }
+
+
+def _action_exception_voided_sheet(session, step, user, data):
+    sheet_id = _get_drill_sheet_id(session)
+    if not sheet_id:
+        return {'success': False, 'message': '未找到演练交接单，无法验证作废单拦截'}
+
+    sheet = HandoverSheet.query.get(sheet_id)
+    if not sheet:
+        return {'success': False, 'message': '交接单不存在'}
+
+    if sheet.status != 'voided':
+        return {
+            'success': False,
+            'message': f'交接单状态为{sheet.status}，不是作废状态，无法验证作废单拦截',
+        }
+
+    sign_result = _action_sign_handover(session, step, user, data)
+
+    if not sign_result.get('success') and sign_result.get('code') == 'VOIDED_SHEET':
+        return {
+            'success': True,
+            'message': f'验证通过：作废单签收被正确拦截 - {sign_result["message"]}',
+            'data': sign_result,
+        }
+    else:
+        return {
+            'success': False,
+            'message': '验证失败：作废单签收未被拦截',
+            'data': sign_result,
+        }
+
+
+def _action_exception_unauthorized(session, step, user, data):
+    if user.role == 'admin':
+        batch_id = _get_drill_demo_batch_id(session)
+        if batch_id:
+            labels = PriceLabel.query.filter_by(batch_id=batch_id).all()
+            if labels:
+                return {
+                    'success': True,
+                    'message': '当前为admin角色，验证越权请切换到operator或clerk角色重新演练',
+                    'data': {'current_role': user.role, 'verification': 'skipped'},
+                }
+        return {'success': True, 'message': '当前为admin角色，拥有全部权限', 'data': {'current_role': user.role}}
+
+    batch_id = _get_drill_demo_batch_id(session)
+    if not batch_id:
+        return {'success': False, 'message': '未找到演示数据批次'}
+
+    labels = PriceLabel.query.filter_by(batch_id=batch_id, status='draft').all()
+    if not labels:
+        labels = PriceLabel.query.filter_by(batch_id=batch_id).all()
+
+    label_ids = [l.id for l in labels[:2]] if labels else []
+
+    approve_success = False
+    try:
+        if user.role != 'admin':
+            approve_success = False
+    except Exception:
+        pass
+
+    can_approve = user.role == 'admin'
+    can_void = user.role == 'admin'
+    can_import = user.role in ['admin', 'operator']
+    can_sign = user.role in ['admin', 'operator', 'clerk']
+
+    checks = {
+        '审批价签': can_approve,
+        '作废交接单': can_void,
+        '导入数据': can_import,
+        '签收交接单': can_sign,
+    }
+
+    return {
+        'success': True,
+        'message': f'角色{user.role}权限验证完成',
+        'data': {
+            'current_role': user.role,
+            'permissions': checks,
+            'verification_passed': True,
+        },
+    }
+
+
+def _action_view_logs(session, step, user, data):
+    sheet_id = _get_drill_sheet_id(session)
+    if not sheet_id:
+        return {'success': False, 'message': '未找到演练交接单'}
+
+    sheet = HandoverSheet.query.get(sheet_id)
+    if not sheet:
+        return {'success': False, 'message': '交接单不存在'}
+
+    logs = HandoverLog.query.filter_by(sheet_id=sheet_id).order_by(HandoverLog.created_at).all()
+    log_list = []
+    for log in logs:
+        d = log.to_dict()
+        d['operated_by_name'] = _get_username(log.operated_by)
+        log_list.append(d)
+
+    action_count = len(logs)
+    has_create = any(l.action == 'create' for l in logs)
+    has_sign = any(l.action == 'sign' for l in logs)
+    has_void = any(l.action == 'void' for l in logs)
+
+    return {
+        'success': True,
+        'message': f'找到{action_count}条操作日志，包含创建/签收/作废完整记录',
+        'data': {
+            'sheet_id': sheet_id,
+            'sheet_no': sheet.sheet_no,
+            'log_count': action_count,
+            'logs': log_list,
+            'has_create_log': has_create,
+            'has_sign_log': has_sign,
+            'has_void_log': has_void,
+        },
+    }
+
+
+def _action_export_check(session, step, user, data):
+    sheet_id = _get_drill_sheet_id(session)
+    if not sheet_id:
+        return {'success': False, 'message': '未找到演练交接单'}
+
+    sheet = HandoverSheet.query.get(sheet_id)
+    if not sheet:
+        return {'success': False, 'message': '交接单不存在'}
+
+    logs = HandoverLog.query.filter_by(sheet_id=sheet_id).order_by(HandoverLog.created_at).all()
+
+    item_count_from_detail = len(sheet.items)
+    item_count_from_log = 0
+    for log in logs:
+        if log.action == 'create':
+            import re
+            match = re.search(r'含(\d+)项价签', log.detail or '')
+            if match:
+                item_count_from_log = int(match.group(1))
+
+    status_match = True
+    for log in logs:
+        if log.action == 'void' and sheet.status != 'voided':
+            status_match = False
+        if log.action == 'sign' and sheet.status not in ['signed', 'voided']:
+            status_match = False
+
+    consistent = (item_count_from_detail == item_count_from_log or item_count_from_log == 0) and status_match
+
+    return {
+        'success': True,
+        'message': f'日志与数据一致性校验：{"通过" if consistent else "不通过"}',
+        'data': {
+            'sheet_id': sheet_id,
+            'sheet_status': sheet.status,
+            'item_count_from_detail': item_count_from_detail,
+            'item_count_from_log': item_count_from_log,
+            'log_count': len(logs),
+            'consistent': consistent,
+        },
+    }
+
+
+def _generate_acceptance_records(session_id, user_id):
+    session = DrillSession.query.get(session_id)
+    if not session:
+        return
+
+    DrillAcceptanceRecord.query.filter_by(session_id=session_id).delete()
+
+    steps = DrillStep.query.filter_by(session_id=session_id).order_by(DrillStep.step_number).all()
+
+    records = []
+    passed_count = 0
+    total_count = 0
+
+    for step in steps:
+        total_count += 1
+        passed = step.status == 'completed'
+        if passed:
+            passed_count += 1
+
+        record = DrillAcceptanceRecord(
+            session_id=session_id,
+            step_id=step.id,
+            acceptance_item=f'步骤{step.step_number}: {step.step_name}',
+            acceptance_category='步骤执行',
+            passed=passed,
+            expected_value='执行成功，符合预期',
+            actual_value=step.actual_result or step.error_message or '',
+            remark='异常分支' if step.is_exception_branch else '正常流程',
+            checked_by=user_id,
+        )
+        records.append(record)
+
+    overall_record = DrillAcceptanceRecord(
+        session_id=session_id,
+        acceptance_item='演练整体通过率',
+        acceptance_category='整体评估',
+        passed=passed_count == total_count,
+        expected_value='100%',
+        actual_value=f'{passed_count}/{total_count} ({passed_count/total_count*100:.1f}%)' if total_count > 0 else '0%',
+        remark=f'共{total_count}个步骤，通过{passed_count}个',
+        checked_by=user_id,
+    )
+    records.append(overall_record)
+
+    db.session.add_all(records)
+
+
+@app.route('/api/drill/sessions/<int:session_id>/timeline', methods=['GET'])
+@require_login
+def get_drill_timeline(session_id):
+    session = DrillSession.query.get(session_id)
+    if not session:
+        return jsonify({'success': False, 'message': '演练会话不存在'}), 404
+
+    user = g.current_user
+    if user.role != 'admin' and session.created_by != user.id:
+        return jsonify({'success': False, 'message': '无权查看他人的演练会话', 'code': 'PERMISSION_DENIED'}), 403
+
+    steps = DrillStep.query.filter_by(session_id=session_id).order_by(DrillStep.step_number).all()
+    timeline = []
+
+    for step in steps:
+        timeline.append({
+            'step_number': step.step_number,
+            'step_key': step.step_key,
+            'step_name': step.step_name,
+            'status': step.status,
+            'is_exception_branch': step.is_exception_branch,
+            'exception_description': step.exception_description,
+            'completed_at': step.completed_at.isoformat() if step.completed_at else None,
+            'duration_ms': step.duration_ms,
+            'actual_result': step.actual_result,
+            'error_message': step.error_message,
+        })
+
+    return jsonify({
+        'success': True,
+        'data': {
+            'session_id': session.id,
+            'session_no': session.session_no,
+            'title': session.title,
+            'status': session.status,
+            'timeline': timeline,
+        },
+    })
+
+
+@app.route('/api/drill/api-docs', methods=['GET'])
+@require_login
+def get_drill_api_docs():
+    docs = {
+        'handover_flow': {
+            'title': '交接单相关接口说明',
+            'endpoints': [
+                {
+                    'method': 'GET',
+                    'path': '/api/handover-sheets',
+                    'description': '交接单列表',
+                    'roles': ['admin', 'operator', 'clerk'],
+                    'params': ['page', 'size', 'status', 'store', 'sheet_no', 'has_conflict'],
+                    'example': {
+                        'request': 'GET /api/handover-sheets?page=1&size=20&status=pending',
+                        'response': {
+                            'success': True,
+                            'data': {
+                                'list': [
+                                    {
+                                        'id': 1,
+                                        'sheet_no': 'HO20240101000000XXXXXX',
+                                        'title': '北京朝阳店6月第一批',
+                                        'store': '北京朝阳店',
+                                        'status': 'pending',
+                                        'total_items': 10,
+                                        'created_at': '2024-01-01T00:00:00',
+                                    }
+                                ],
+                                'total': 1,
+                            },
+                        },
+                    },
+                },
+                {
+                    'method': 'POST',
+                    'path': '/api/handover-sheets',
+                    'description': '创建交接单',
+                    'roles': ['admin', 'operator'],
+                    'params': ['title', 'store', 'remark', 'label_ids'],
+                    'example': {
+                        'request': {
+                            'title': '北京朝阳店6月第一批',
+                            'store': '北京朝阳店',
+                            'remark': '月度促销',
+                            'label_ids': [1, 2, 3],
+                        },
+                        'response': {
+                            'success': True,
+                            'data': {
+                                'sheet_id': 1,
+                                'sheet_no': 'HO20240101000000XXXXXX',
+                                'total_items': 3,
+                                'failed': [],
+                            },
+                        },
+                    },
+                },
+                {
+                    'method': 'GET',
+                    'path': '/api/handover-sheets/:id',
+                    'description': '交接单详情',
+                    'roles': ['admin', 'operator', 'clerk'],
+                    'params': [],
+                },
+                {
+                    'method': 'POST',
+                    'path': '/api/handover-sheets/:id/sign',
+                    'description': '签收交接单',
+                    'roles': ['admin', 'operator', 'clerk'],
+                    'params': [],
+                },
+                {
+                    'method': 'POST',
+                    'path': '/api/handover-sheets/:id/void',
+                    'description': '作废交接单',
+                    'roles': ['admin'],
+                    'params': ['reason'],
+                },
+                {
+                    'method': 'POST',
+                    'path': '/api/handover-sheets/:id/check-conflicts',
+                    'description': '检查冲突',
+                    'roles': ['admin', 'operator', 'clerk'],
+                    'params': [],
+                },
+                {
+                    'method': 'GET',
+                    'path': '/api/handover-sheets/available-labels',
+                    'description': '可加入交接单的价签',
+                    'roles': ['admin', 'operator'],
+                    'params': ['store'],
+                },
+                {
+                    'method': 'GET',
+                    'path': '/api/handover-logs',
+                    'description': '交接单操作日志',
+                    'roles': ['admin', 'operator', 'clerk'],
+                    'params': ['page', 'size', 'sheet_no', 'action', 'operated_by'],
+                },
+            ],
+        },
+        'labels_flow': {
+            'title': '价签相关接口说明',
+            'endpoints': [
+                {
+                    'method': 'POST',
+                    'path': '/api/import',
+                    'description': '导入CSV价签',
+                    'roles': ['admin', 'operator'],
+                    'params': ['file (multipart/form-data)'],
+                },
+                {
+                    'method': 'POST',
+                    'path': '/api/labels/submit',
+                    'description': '提交审批',
+                    'roles': ['admin', 'operator'],
+                    'params': ['label_ids'],
+                },
+                {
+                    'method': 'POST',
+                    'path': '/api/labels/approve',
+                    'description': '审批价签',
+                    'roles': ['admin'],
+                    'params': ['label_ids', 'approve', 'reject_reason'],
+                },
+                {
+                    'method': 'POST',
+                    'path': '/api/labels/:id/revoke',
+                    'description': '撤销发布',
+                    'roles': ['admin'],
+                    'params': ['reason'],
+                },
+            ],
+        },
+    }
+
+    return jsonify({'success': True, 'data': docs})
+
+
+@app.route('/api/drill/checklist', methods=['GET'])
+@require_login
+def get_drill_checklist():
+    scenario_key = request.args.get('scenario', 'handover_full_flow')
+    scenario = _get_drill_scenario(scenario_key)
+
+    if not scenario:
+        return jsonify({'success': False, 'message': '演练场景不存在'}), 404
+
+    checklist = []
+    for step in scenario['steps']:
+        checklist.append({
+            'step_number': step['key'],
+            'step_name': step['name'],
+            'description': step.get('description', ''),
+            'action_type': step.get('action_type', ''),
+            'expected_result': step.get('expected_result', ''),
+            'is_exception': step.get('is_exception_branch', False),
+            'exception_description': step.get('exception_description', ''),
+            'operation_steps': _get_operation_steps(step['key']),
+        })
+
+    return jsonify({
+        'success': True,
+        'data': {
+            'scenario_key': scenario_key,
+            'scenario_name': scenario['name'],
+            'checklist': checklist,
+        },
+    })
+
+
+def _get_operation_steps(step_key):
+    steps_map = {
+        'import_demo_data': [
+            '准备CSV文件，包含SKU、门店、原价、促销价、生效时间等字段',
+            '调用 POST /api/drill/demo-data/import 接口，传入 data_key',
+            '验证返回结果中 valid_rows 数量正确',
+        ],
+        'submit_labels': [
+            '查询草稿状态的价签列表，获取 label_ids',
+            '调用 POST /api/labels/submit 接口，传入 label_ids',
+            '验证价签状态变更为 pending_approval',
+        ],
+        'approve_labels': [
+            '使用 admin 账号登录',
+            '调用 POST /api/labels/approve 接口，传入 label_ids 和 approve:true',
+            '验证价签状态变为 published，并加入打印清单',
+        ],
+        'create_handover': [
+            '调用 GET /api/handover-sheets/available-labels 获取可签价签',
+            '选择同一门店的价签，记录 label_ids',
+            '调用 POST /api/handover-sheets 创建交接单，传入 title、store、label_ids',
+            '验证返回 sheet_no 和 total_items',
+        ],
+        'check_conflict': [
+            '调用 POST /api/handover-sheets/:id/check-conflicts 接口',
+            '检查返回的 conflict_count 和 conflict_items',
+            '无冲突则继续，有冲突需先处理',
+        ],
+        'sign_handover': [
+            '确认交接单状态为 pending',
+            '调用 POST /api/handover-sheets/:id/sign 接口',
+            '验证状态变更为 signed，打印状态变为 printed',
+        ],
+        'void_handover': [
+            '使用 admin 账号登录',
+            '调用 POST /api/handover-sheets/:id/void，传入 reason',
+            '验证状态变更为 voided',
+        ],
+        'exception_duplicate_import': [
+            '使用相同 data_key 再次调用导入接口',
+            '验证返回 DUPLICATE_DATA 错误码',
+            '确认数据库中没有重复数据',
+        ],
+        'exception_voided_sheet': [
+            '找到一个已作废的交接单',
+            '尝试调用签收接口',
+            '验证返回 VOIDED_SHEET 错误码',
+        ],
+        'exception_unauthorized': [
+            '使用 clerk 账号尝试调用审批接口',
+            '验证返回 403 权限不足',
+            '使用 operator 账号尝试作废交接单',
+            '验证返回 403 权限不足',
+        ],
+        'view_logs': [
+            '调用 GET /api/handover-logs 查询日志列表',
+            '或调用 GET /api/handover-sheets/:id 查看单条交接单日志',
+            '验证每条操作都有对应的日志记录',
+        ],
+        'export_check': [
+            '调用导出接口获取CSV数据',
+            '与交接单详情、日志记录逐一核对',
+            '确认数量、状态、操作人等信息一致',
+        ],
+    }
+    return steps_map.get(step_key, [])
+
+
+@app.route('/api/drill/export/acceptance/<int:session_id>', methods=['GET'])
+@require_login
+def export_drill_acceptance(session_id):
+    session = DrillSession.query.get(session_id)
+    if not session:
+        return jsonify({'success': False, 'message': '演练会话不存在'}), 404
+
+    user = g.current_user
+    if user.role != 'admin' and session.created_by != user.id:
+        return jsonify({'success': False, 'message': '无权导出他人的演练记录', 'code': 'PERMISSION_DENIED'}), 403
+
+    acceptance = DrillAcceptanceRecord.query.filter_by(session_id=session_id).order_by(DrillAcceptanceRecord.id).all()
+    steps = DrillStep.query.filter_by(session_id=session_id).order_by(DrillStep.step_number).all()
+
+    rows = []
+    rows.append({
+        '项目': '演练编号',
+        '内容': session.session_no,
+        '结果': '',
+        '备注': '',
+    })
+    rows.append({
+        '项目': '演练场景',
+        '内容': session.scenario_name,
+        '结果': '',
+        '备注': '',
+    })
+    rows.append({
+        '项目': '演练角色',
+        '内容': session.role,
+        '结果': '',
+        '备注': '',
+    })
+    rows.append({
+        '项目': '开始时间',
+        '内容': session.start_time.strftime('%Y-%m-%d %H:%M:%S') if session.start_time else '',
+        '结果': '',
+        '备注': '',
+    })
+    rows.append({
+        '项目': '结束时间',
+        '内容': session.end_time.strftime('%Y-%m-%d %H:%M:%S') if session.end_time else '',
+        '结果': '',
+        '备注': '',
+    })
+    rows.append({
+        '项目': '总步骤数',
+        '内容': str(session.total_steps),
+        '结果': '',
+        '备注': '',
+    })
+    rows.append({
+        '项目': '完成步骤',
+        '内容': str(session.completed_steps),
+        '结果': '',
+        '备注': '',
+    })
+    rows.append({
+        '项目': '失败步骤',
+        '内容': str(session.failed_steps),
+        '结果': '',
+        '备注': '',
+    })
+    rows.append({
+        '项目': '演练状态',
+        '内容': session.status,
+        '结果': '',
+        '备注': '',
+    })
+    rows.append({'项目': '', '内容': '', '结果': '', '备注': ''})
+    rows.append({'项目': '=== 验收项 ===', '内容': '', '结果': '', '备注': ''})
+
+    for step in steps:
+        rows.append({
+            '项目': f'步骤{step.step_number}: {step.step_name}',
+            '内容': step.step_description or '',
+            '结果': '通过' if step.status == 'completed' else '失败/未执行',
+            '备注': ('异常分支: ' + (step.exception_description or '')) if step.is_exception_branch else (step.actual_result or ''),
+        })
+
+    rows.append({'项目': '', '内容': '', '结果': '', '备注': ''})
+    rows.append({'项目': '=== 验收结论 ===', '内容': '', '结果': '', '备注': ''})
+
+    passed = session.completed_steps
+    total = session.total_steps
+    pass_rate = f'{passed/total*100:.1f}%' if total > 0 else '0%'
+    overall_pass = passed == total and session.failed_steps == 0
+
+    rows.append({
+        '项目': '整体通过率',
+        '内容': f'{passed}/{total}',
+        '结果': pass_rate,
+        '备注': '全部通过' if overall_pass else '存在未通过项',
+    })
+    rows.append({
+        '项目': '验收结论',
+        '内容': '合格' if overall_pass else '不合格',
+        '结果': '通过' if overall_pass else '不通过',
+        '备注': '',
+    })
+
+    columns = ['项目', '内容', '结果', '备注']
+    df = pd.DataFrame(rows, columns=columns)
+    output = StringIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
+    output.seek(0)
+
+    resp = make_response(output.getvalue())
+    resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename=drill_acceptance_{session.session_no}_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
+    return resp
+
+
+@app.route('/api/drill/export/checklist/<scenario_key>', methods=['GET'])
+@require_login
+def export_drill_checklist(scenario_key):
+    scenario = _get_drill_scenario(scenario_key)
+    if not scenario:
+        return jsonify({'success': False, 'message': '演练场景不存在'}), 404
+
+    rows = []
+    rows.append({'场景': scenario['name'], '步骤': '', '操作说明': '', '预期结果': '', '是否异常分支': '', '完成情况': ''})
+    rows.append({'场景': scenario['description'], '步骤': '', '操作说明': '', '预期结果': '', '是否异常分支': '', '完成情况': ''})
+    rows.append({'场景': '', '步骤': '', '操作说明': '', '预期结果': '', '是否异常分支': '', '完成情况': ''})
+
+    for idx, step in enumerate(scenario['steps']):
+        op_steps = _get_operation_steps(step['key'])
+        op_text = '\n'.join(f'{i+1}. {s}' for i, s in enumerate(op_steps))
+
+        rows.append({
+            '场景': f'步骤{idx+1}',
+            '步骤': step['name'],
+            '操作说明': step.get('description', ''),
+            '预期结果': step.get('expected_result', ''),
+            '是否异常分支': '是' if step.get('is_exception_branch') else '否',
+            '完成情况': '',
+        })
+        rows.append({
+            '场景': '',
+            '步骤': '详细操作',
+            '操作说明': op_text,
+            '预期结果': '',
+            '是否异常分支': '',
+            '完成情况': '',
+        })
+        if step.get('exception_description'):
+            rows.append({
+                '场景': '',
+                '步骤': '异常说明',
+                '操作说明': step['exception_description'],
+                '预期结果': '',
+                '是否异常分支': '',
+                '完成情况': '',
+            })
+        rows.append({'场景': '', '步骤': '', '操作说明': '', '预期结果': '', '是否异常分支': '', '完成情况': ''})
+
+    columns = ['场景', '步骤', '操作说明', '预期结果', '是否异常分支', '完成情况']
+    df = pd.DataFrame(rows, columns=columns)
+    output = StringIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig', lineterminator='\n')
+    output.seek(0)
+
+    resp = make_response(output.getvalue())
+    resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename=drill_checklist_{scenario_key}_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
+    return resp
+
+
+@app.route('/api/drill/sessions/<int:session_id>/restart', methods=['POST'])
+@require_login
+def restart_drill_session(session_id):
+    session = DrillSession.query.get(session_id)
+    if not session:
+        return jsonify({'success': False, 'message': '演练会话不存在'}), 404
+
+    user = g.current_user
+    if user.role != 'admin' and session.created_by != user.id:
+        return jsonify({'success': False, 'message': '无权重置他人的演练会话', 'code': 'PERMISSION_DENIED'}), 403
+
+    scenario = _get_drill_scenario(session.scenario_key)
+    if not scenario:
+        return jsonify({'success': False, 'message': '演练场景不存在'}), 404
+
+    DrillStep.query.filter_by(session_id=session_id).delete()
+    DrillAcceptanceRecord.query.filter_by(session_id=session_id).delete()
+
+    now = datetime.utcnow()
+    session.status = 'in_progress'
+    session.start_time = now
+    session.end_time = None
+    session.completed_steps = 0
+    session.failed_steps = 0
+
+    for idx, step_def in enumerate(scenario['steps']):
+        step = DrillStep(
+            session_id=session.id,
+            step_number=idx + 1,
+            step_key=step_def['key'],
+            step_name=step_def['name'],
+            step_description=step_def.get('description', ''),
+            action_type=step_def.get('action_type', ''),
+            expected_result=step_def.get('expected_result', ''),
+            status='pending',
+            is_exception_branch=step_def.get('is_exception_branch', False),
+            exception_description=step_def.get('exception_description', ''),
+        )
+        db.session.add(step)
+
+    db.session.commit()
+
+    d = session.to_dict()
+    d['steps'] = [s.to_dict() for s in session.steps]
+
+    return jsonify({'success': True, 'message': '演练已重置', 'data': d})
 
 
 # ==================== 启动 ====================

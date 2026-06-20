@@ -421,3 +421,157 @@ class HandoverLog(db.Model):
             'operated_by': self.operated_by,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class DrillDemoData(db.Model):
+    __tablename__ = 'drill_demo_data'
+    id = db.Column(db.Integer, primary_key=True)
+    data_key = db.Column(db.String(100), unique=True, nullable=False)
+    data_name = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text)
+    data_type = db.Column(db.String(50), default='labels')
+    content = db.Column(db.Text, nullable=False)
+    is_active = db.Column(db.Boolean, default=True)
+    imported_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    imported_at = db.Column(db.DateTime, default=datetime.utcnow)
+    import_batch_id = db.Column(db.Integer)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'data_key': self.data_key,
+            'data_name': self.data_name,
+            'description': self.description,
+            'data_type': self.data_type,
+            'is_active': self.is_active,
+            'imported_by': self.imported_by,
+            'imported_at': self.imported_at.isoformat() if self.imported_at else None,
+            'import_batch_id': self.import_batch_id,
+        }
+
+
+class DrillSession(db.Model):
+    __tablename__ = 'drill_sessions'
+    id = db.Column(db.Integer, primary_key=True)
+    session_no = db.Column(db.String(50), unique=True, nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    scenario_key = db.Column(db.String(100), nullable=False)
+    scenario_name = db.Column(db.String(200), nullable=False)
+    role = db.Column(db.String(20), nullable=False)
+    status = db.Column(db.String(20), default='in_progress')
+    total_steps = db.Column(db.Integer, default=0)
+    completed_steps = db.Column(db.Integer, default=0)
+    failed_steps = db.Column(db.Integer, default=0)
+    start_time = db.Column(db.DateTime, default=datetime.utcnow)
+    end_time = db.Column(db.DateTime)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    remark = db.Column(db.Text)
+    demo_data_key = db.Column(db.String(100))
+
+    steps = db.relationship('DrillStep', backref='session', cascade='all, delete-orphan', order_by='DrillStep.step_number')
+    acceptance_records = db.relationship('DrillAcceptanceRecord', backref='session', cascade='all, delete-orphan')
+
+    __table_args__ = (
+        db.Index('idx_drill_session_status', 'status'),
+        db.Index('idx_drill_session_role', 'role'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'session_no': self.session_no,
+            'title': self.title,
+            'scenario_key': self.scenario_key,
+            'scenario_name': self.scenario_name,
+            'role': self.role,
+            'status': self.status,
+            'total_steps': self.total_steps,
+            'completed_steps': self.completed_steps,
+            'failed_steps': self.failed_steps,
+            'start_time': self.start_time.isoformat() if self.start_time else None,
+            'end_time': self.end_time.isoformat() if self.end_time else None,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'remark': self.remark,
+            'demo_data_key': self.demo_data_key,
+        }
+
+
+class DrillStep(db.Model):
+    __tablename__ = 'drill_steps'
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('drill_sessions.id'), nullable=False)
+    step_number = db.Column(db.Integer, nullable=False)
+    step_key = db.Column(db.String(100), nullable=False)
+    step_name = db.Column(db.String(200), nullable=False)
+    step_description = db.Column(db.Text)
+    action_type = db.Column(db.String(50))
+    expected_result = db.Column(db.Text)
+    actual_result = db.Column(db.Text)
+    status = db.Column(db.String(20), default='pending')
+    request_data = db.Column(db.Text)
+    response_data = db.Column(db.Text)
+    error_message = db.Column(db.Text)
+    completed_at = db.Column(db.DateTime)
+    duration_ms = db.Column(db.Integer)
+    is_exception_branch = db.Column(db.Boolean, default=False)
+    exception_description = db.Column(db.Text)
+
+    __table_args__ = (
+        db.UniqueConstraint('session_id', 'step_number', name='uq_drill_step_session_number'),
+        db.UniqueConstraint('session_id', 'step_key', name='uq_drill_step_session_key'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'session_id': self.session_id,
+            'step_number': self.step_number,
+            'step_key': self.step_key,
+            'step_name': self.step_name,
+            'step_description': self.step_description,
+            'action_type': self.action_type,
+            'expected_result': self.expected_result,
+            'actual_result': self.actual_result,
+            'status': self.status,
+            'request_data': self.request_data,
+            'response_data': self.response_data,
+            'error_message': self.error_message,
+            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'duration_ms': self.duration_ms,
+            'is_exception_branch': self.is_exception_branch,
+            'exception_description': self.exception_description,
+        }
+
+
+class DrillAcceptanceRecord(db.Model):
+    __tablename__ = 'drill_acceptance_records'
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('drill_sessions.id'), nullable=False)
+    step_id = db.Column(db.Integer, db.ForeignKey('drill_steps.id'))
+    acceptance_item = db.Column(db.String(200), nullable=False)
+    acceptance_category = db.Column(db.String(50))
+    passed = db.Column(db.Boolean, default=False)
+    expected_value = db.Column(db.Text)
+    actual_value = db.Column(db.Text)
+    remark = db.Column(db.Text)
+    checked_at = db.Column(db.DateTime, default=datetime.utcnow)
+    checked_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+
+    step = db.relationship('DrillStep', foreign_keys=[step_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'session_id': self.session_id,
+            'step_id': self.step_id,
+            'acceptance_item': self.acceptance_item,
+            'acceptance_category': self.acceptance_category,
+            'passed': self.passed,
+            'expected_value': self.expected_value,
+            'actual_value': self.actual_value,
+            'remark': self.remark,
+            'checked_at': self.checked_at.isoformat() if self.checked_at else None,
+            'checked_by': self.checked_by,
+        }

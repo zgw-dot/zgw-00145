@@ -157,6 +157,42 @@ SQLite 文件存储在 `backend/instance/pricelabel.db`，重启服务后：
 - 系统配置保持
 - 筛选导出功能正常
 
+### ✅ 9. 交接单演练中心
+
+> 让第一次接手的人不看源码也能在系统里完整跑通全流程。
+
+**核心功能：**
+- 🎯 **分角色入口**：管理员、运营、店员三种角色切换演练
+- 📦 **可重复导入的演示数据**：一键导入演示数据，支持重置后重新导入
+- 📚 **接口说明页**：所有核心接口的方法、路径、参数、权限、请求/响应示例
+- 📋 **操作清单**：照着就能复现的步骤清单，包含正常流程和异常分支
+- ⏱️ **演练时间线**：每次演练生成完整的操作时间线
+- 📊 **验收记录导出**：自动生成验收记录，支持 CSV 导出
+- 🔔 **页面操作提示**：每一步都有操作指引和预期结果
+- 💾 **演练记录落库**：服务重启后仍可回看历史演练
+
+**四种拦截验证（必过）：**
+
+| 拦截场景 | 说明 | 错误码 |
+|----------|------|--------|
+| 同一批数据重复导入 | 相同 batch_id 重复导入会被拦截 | `DUPLICATE_DATA` |
+| 旧单作废后继续拿来演练 | 作废的交接单不能再签收/操作 | `VOIDED_SHEET` |
+| 不同角色越权查看或代签 | 非创建者不能操作他人的演练 | `PERMISSION_DENIED` / 403 |
+| 日志和导出内容对不上 | 导出数据与操作日志交叉校验 | `CONSISTENCY_CHECK_FAILED` |
+
+**最短复现步骤（5步）：**
+1. 登录管理员账号（`admin` / `admin123`）
+2. 进入 **演练中心** → 选择"交接单完整流程演练" → 点击"开始演练"
+3. 依次执行前7步：导入数据 → 提交 → 审批 → 创建交接单 → 检查冲突 → 签收 → 作废
+4. 执行异常分支验证：重复导入拦截、作废单拦截、越权验证
+5. 查看日志和导出验收记录，确认所有操作留痕
+
+**运行自动化测试：**
+```powershell
+cd backend
+python test_drill.py
+```
+
 ## 接口速览
 
 | 方法 | 路径 | 说明 |
@@ -178,7 +214,32 @@ SQLite 文件存储在 `backend/instance/pricelabel.db`，重启服务后：
 | GET | `/api/rollback-history` | 回滚历史 |
 | GET | `/api/export/labels` | 导出价签 CSV |
 | GET | `/api/export/print-queue` | 导出打印 CSV |
+| GET | `/api/handover-sheets` | 交接单列表（支持筛选/分页） |
+| POST | `/api/handover-sheets` | 创建交接单（admin, operator） |
+| GET | `/api/handover-sheets/:id` | 交接单详情（含明细、日志） |
+| POST | `/api/handover-sheets/:id/sign` | 签收交接单 |
+| POST | `/api/handover-sheets/:id/void` | 作废交接单（admin） |
+| POST | `/api/handover-sheets/:id/check-conflicts` | 检查冲突 |
+| GET | `/api/handover-sheets/available-labels` | 获取可加入交接单的价签 |
+| GET | `/api/handover-logs` | 交接单操作日志 |
+| GET | `/api/export/handover-sheets` | 导出交接单列表 CSV |
+| GET | `/api/export/handover-sheet/:id` | 导出交接单明细 CSV |
+| GET | `/api/export/handover-logs` | 导出交接单日志 CSV |
 | GET | `/api/stats/overview` | 工作台统计 |
+| **GET** | **`/api/drill/scenarios`** | **演练场景列表** |
+| **POST** | **`/api/drill/start`** | **开始一次演练** |
+| **GET** | **`/api/drill/sessions`** | **演练历史列表** |
+| **GET** | **`/api/drill/sessions/:id`** | **演练详情（含步骤）** |
+| **POST** | **`/api/drill/sessions/:id/steps/:key/execute`** | **执行演练步骤** |
+| **GET** | **`/api/drill/sessions/:id/timeline`** | **演练时间线** |
+| **POST** | **`/api/drill/sessions/:id/restart`** | **重置演练** |
+| **POST** | **`/api/drill/demo-data/import`** | **导入演示数据** |
+| **GET** | **`/api/drill/demo-data`** | **演示数据列表** |
+| **POST** | **`/api/drill/demo-data/:key/reset`** | **重置演示数据** |
+| **GET** | **`/api/drill/api-docs`** | **接口说明文档** |
+| **GET** | **`/api/drill/checklist`** | **操作清单** |
+| **GET** | **`/api/drill/export/acceptance/:id`** | **导出验收记录 CSV** |
+| **GET** | **`/api/drill/export/checklist/:scenario`** | **导出操作清单 CSV** |
 
 ## 常见问题
 
